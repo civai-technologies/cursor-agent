@@ -318,11 +318,16 @@ def web_search(
     try:
         logger.info(f"Performing web search for: {search_term}")
 
-        # Get API keys from environment
+        # Provider selection: default to Google for backward compatibility
+        search_provider = os.environ.get("WEB_SEARCH_PROVIDER", "google").strip().lower()
         google_api_key = os.environ.get("GOOGLE_API_KEY")
         google_search_engine_id = os.environ.get("GOOGLE_SEARCH_ENGINE_ID")
+        ydc_api_key = os.environ.get("YDC_API_KEY")
 
-        if not google_api_key or not google_search_engine_id:
+        if search_provider not in ["google", "you"]:
+            return {"error": "Unsupported WEB_SEARCH_PROVIDER. Use 'google' or 'you'.", "results": []}
+
+        if search_provider == "google" and (not google_api_key or not google_search_engine_id):
             logger.error("Missing Google API key or Search Engine ID in environment variables")
             return {
                 "error": "Missing API keys. Please set GOOGLE_API_KEY and GOOGLE_SEARCH_ENGINE_ID environment variables.",
@@ -347,10 +352,12 @@ def web_search(
                 "message": "This query doesn't require up-to-date information. Set force=True to force a web search."
             }
 
-        # Perform Google search
-        logger.info("Performing internet search using Google Custom Search API...")
-        # Call google_search synchronously
-        search_results = google_search_sync(search_term, google_api_key, google_search_engine_id, max_results=max_results)
+        if search_provider == "you":
+            logger.info("Performing internet search using You.com Search API...")
+            search_results = you_search_sync(search_term, ydc_api_key, max_results=max_results)
+        else:
+            logger.info("Performing internet search using Google Custom Search API...")
+            search_results = google_search_sync(search_term, google_api_key, google_search_engine_id, max_results=max_results)
 
         if not search_results:
             logger.warning("No search results found")
@@ -475,6 +482,37 @@ def google_search_sync(query: str, api_key: str, search_engine_id: str, max_resu
         return {}
     except Exception as e:
         logger.error(f"Unexpected error during Google search: {e}")
+        return {}
+
+
+def you_search_sync(query: str, api_key: Optional[str], max_results: int = 5) -> Dict[str, Dict[str, Any]]:
+    """Perform a search using You.com Search API synchronously."""
+    try:
+        logger.info(f"Performing You.com Search for: {query} (max_results: {max_results})")
+        params = {"query": query, "count": str(max_results)}
+        headers: Dict[str, str] = {}
+        if api_key:
+            headers["X-API-Key"] = api_key
+
+        response = requests.get("https://api.you.com/v1/agents/search", params=params, headers=headers, timeout=20)
+        if response.status_code != 200:
+            logger.error(f"You.com Search API error {response.status_code}: {response.text}")
+            return {}
+
+        data = response.json()
+        results: Dict[str, Dict[str, Any]] = {}
+        for section in ["web", "news"]:
+            for item in data.get("results", {}).get(section, [])[:max_results]:
+                url = item.get("url")
+                if not url:
+                    continue
+                results[url] = {
+                    "title": item.get("title", "Unknown Title"),
+                    "snippet": item.get("description", ""),
+                }
+        return results
+    except Exception as e:
+        logger.error(f"Unexpected error during You.com search: {e}")
         return {}
 
 

@@ -110,9 +110,16 @@ ANTHROPIC_API_KEY=your_anthropic_api_key_here
 ANTHROPIC_API_MODEL=claude-3-5-sonnet-latest
 ANTHROPIC_TEMPERATURE=0.0
 
-# Google Search API (for web_search tool)
+# Web search provider for web_search tool
+# google (default) or you
+WEB_SEARCH_PROVIDER=google
+
+# Google Search API (required when WEB_SEARCH_PROVIDER=google)
 GOOGLE_API_KEY=your_google_api_key_here
 GOOGLE_SEARCH_ENGINE_ID=your_search_engine_id_here
+
+# You.com Search API (optional key, supports free tier for Search API)
+YDC_API_KEY=your_ydc_api_key_here
 
 # Ollama configuration (for local models)
 OLLAMA_HOST=http://localhost:11434
@@ -825,3 +832,15 @@ Femi Amoo (Nifemi Alpine)
 Founder of [CIVAI TECHNOLOGIES](https://civai.co)
 
 [![Twitter](https://img.shields.io/twitter/follow/usecodenaija?style=social)](https://twitter.com/usecodenaija) 
+
+### Use You.com Search API with `web_search`
+
+Set the provider and optional API key:
+
+```bash
+export WEB_SEARCH_PROVIDER=you
+# Optional: up to 100 free searches/day without key
+export YDC_API_KEY=your_key_here
+```
+
+The `web_search` tool will then query `https://api.you.com/v1/agents/search` and return normalized results in the same response shape used by existing integrations.
