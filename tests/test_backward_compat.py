@@ -67,11 +67,15 @@ class TestAudienceResolverContracts(unittest.TestCase):
         self.assertIn("primary_tool_call", resp)
 
     def test_web_search_results_keys(self) -> None:
-        """web_search skip path keeps results array (no API keys required)."""
+        """web_search always returns results[]; ok is set even without API keys."""
         ws = web_search(search_term="test", force=False, agent=None)
         self.assertIn("results", ws)
         self.assertIsInstance(ws["results"], list)
         self.assertIn("ok", ws)
+        # Without Google keys, producer must still emit the contract (ok=False).
+        if ws.get("error"):
+            self.assertFalse(ws["ok"])
+            self.assertEqual(ws["results"], [])
 
 
 class TestPodsHookContract(unittest.TestCase):

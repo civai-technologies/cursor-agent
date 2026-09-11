@@ -325,8 +325,9 @@ def web_search(
         if not google_api_key or not google_search_engine_id:
             logger.error("Missing Google API key or Search Engine ID in environment variables")
             return {
+                "ok": False,
                 "error": "Missing API keys. Please set GOOGLE_API_KEY and GOOGLE_SEARCH_ENGINE_ID environment variables.",
-                "results": []
+                "results": [],
             }
 
         # Check if this search requires up-to-date information
