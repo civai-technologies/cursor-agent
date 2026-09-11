@@ -44,7 +44,9 @@ class TestDualEmitToolCall(unittest.TestCase):
         self.assertIn("result", tc)
         self.assertIn("output", tc)
         self.assertEqual(tc["result"], tc["output"])
-        json.loads(tc["result"])
+        result_str = tc["result"]
+        assert isinstance(result_str, str)
+        json.loads(result_str)
 
     def test_tool_call_result_value_fallback(self) -> None:
         legacy = {"name": "t", "parameters": {}, "result": "legacy"}
@@ -60,7 +62,7 @@ class TestAudienceResolverContracts(unittest.TestCase):
         resp = enrich_agent_response({"message": "ok", "tool_calls": tool_calls, "thinking": None})
         self.assertIsInstance(resp, dict)
         self.assertIn("result", resp["tool_calls"][0])
-        data = json.loads(resp["tool_calls"][0]["result"])
+        data = json.loads(str(resp["tool_calls"][0]["result"]))
         self.assertIn("queries", data)
         self.assertIn("primary_tool_call", resp)
 

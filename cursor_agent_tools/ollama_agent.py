@@ -614,7 +614,7 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
             List of tool call results
         """
         logger.info(f"Executing {len(tool_calls)} tool calls")
-        tool_results: List[Dict[str, Any]] = []
+        tool_results: List[Any] = []
 
         for call in tool_calls:
             try:

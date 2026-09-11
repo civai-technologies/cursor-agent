@@ -135,6 +135,7 @@ class TestOpenAILiveChatToolLoop(unittest.TestCase):
             agent.chat("Use the add_numbers tool to add 17 and 25, then report the sum.")
         )
         self.assertIsInstance(response, dict)
+        assert isinstance(response, dict)
         message = str(response.get("message") or "")
         if message.startswith("Error:") and not response.get("tool_calls"):
             self.skipTest(f"OpenAI live call unavailable: {message[:160]}")
@@ -158,6 +159,7 @@ class TestClaudeLiveChatToolLoop(unittest.TestCase):
             agent.chat("Use the add_numbers tool to add 17 and 25, then report the sum.")
         )
         self.assertIsInstance(response, dict)
+        assert isinstance(response, dict)
         message = str(response.get("message") or "")
         if message.startswith("Error:") and not response.get("tool_calls"):
             # Billing / auth / quota — not a package regression
