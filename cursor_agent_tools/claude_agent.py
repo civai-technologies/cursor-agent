@@ -5,6 +5,13 @@ from typing import Any, Dict, List, Optional, Callable, Union
 from anthropic import APIError, AsyncAnthropic, AuthenticationError, BadRequestError, RateLimitError
 
 from .base import BaseAgent, AgentResponse, AgentToolCall
+from .schemas import (
+    TERMINATE_TEXT_SENTINEL,
+    build_agent_tool_call,
+    enrich_agent_response,
+    is_terminate_tool,
+    llm_tool_content,
+)
 from .logger import get_logger
 from .permissions import PermissionOptions, PermissionRequest, PermissionStatus
 from .tools.register_tools import register_default_tools
@@ -204,71 +211,56 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
         Returns:
             List of tool call results formatted for the Claude API
         """
+        results, _records = self._execute_tool_calls_with_records(tool_calls)
+        return results
+
+    def _execute_tool_calls_with_records(
+        self, tool_calls: List[Dict[str, Any]]
+    ) -> tuple:
+        """Execute tool calls; return (Claude tool_result messages, records by id).
+
+        Records carry the normalized ToolResult so the chat flow can build
+        dual-emit AgentToolCall entries without re-running tools.
+        """
         logger.info(f"Executing {len(tool_calls)} tool calls")
-        tool_results = []
+        tool_results: List[Dict[str, Any]] = []
+        records: Dict[str, Dict[str, Any]] = {}
 
         for call in tool_calls:
             tool_name = call["name"]
             tool_id = call.get("id")
             arguments = call.get("input", {})
+            if not isinstance(arguments, dict):
+                arguments = {}
 
             logger.debug(f"Executing tool: {tool_name} (id: {tool_id})")
-            logger.debug(f"Tool arguments: {json.dumps(arguments)}")
+            normalized = self.run_registered_tool(tool_name, arguments)
+            content = llm_tool_content(normalized)
+            is_error = not normalized["ok"]
 
-            # Format for user message with tool_result as required by the Claude API
-            result_message = {"role": "user", "content": []}
-
-            if tool_name not in self.available_tools:
-                # Add error result
-                error_msg = f"Tool '{tool_name}' not found. Error: Tool not available."
-                logger.warning(f"Tool not found: {tool_name}")
-                result_message["content"].append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tool_id,
-                        "is_error": True,
-                        "content": error_msg,
-                    }
-                )
+            if is_error:
+                logger.warning(f"Tool {tool_name} returned error: {normalized.get('error')}")
             else:
-                try:
-                    function = self.available_tools[tool_name]["function"]
-                    # Convert input to the expected format for the function
-                    logger.debug(f"Calling function for tool: {tool_name}")
-                    result = function(**arguments)
+                content_preview = content[:100] + "..." if len(content) > 100 else content
+                logger.debug(f"Tool {tool_name} result: {content_preview}")
 
-                    # Format the result based on whether it's a string or a JSON-serializable object
-                    content = result if isinstance(result, str) else json.dumps(result)
-
-                    # Log a summary of the result
-                    if isinstance(result, dict) and "error" in result:
-                        logger.warning(f"Tool {tool_name} returned error: {result.get('error')}")
-                    else:
-                        content_preview = content[:100] + "..." if len(content) > 100 else content
-                        logger.debug(f"Tool {tool_name} result: {content_preview}")
-
-                    # Add tool result
-                    result_message["content"].append(
-                        {"type": "tool_result", "tool_use_id": tool_id, "content": content}
-                    )
-                except Exception as e:
-                    error_msg = f"Error executing tool {tool_name}: {str(e)}"
-                    logger.error(f"Error executing tool {tool_name}: {str(e)}")
-                    result_message["content"].append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": tool_id,
-                            "is_error": True,
-                            "content": error_msg,
-                        }
-                    )
-
-            # Only add messages with non-empty content
-            if result_message["content"]:
-                tool_results.append(result_message)
+            block: Dict[str, Any] = {
+                "type": "tool_result",
+                "tool_use_id": tool_id,
+                "content": content,
+            }
+            if is_error:
+                block["is_error"] = True
+            tool_results.append({"role": "user", "content": [block]})
+            records[str(tool_id)] = {
+                "name": tool_name,
+                "parameters": arguments,
+                "normalized": normalized,
+                "llm_content": content,
+            }
 
         logger.info(f"Completed {len(tool_results)} tool call results")
-        return tool_results
+        return tool_results, records
 
     async def chat(self, message: str, user_info: Optional[Dict[str, Any]] = None) -> Union[str, AgentResponse]:
         """
@@ -314,9 +306,10 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
 
         try:
             # Make the API call
+            max_tokens_value = self._resolve_max_tokens(4096)
             api_params = {
                 "model": self.model if self.model else "claude-3-5-sonnet-latest",
-                "max_tokens": 4096,
+                "max_tokens": max_tokens_value,
                 "temperature": self.temperature,
                 "system": self.system_prompt,  # System prompt as a separate parameter
             }
@@ -347,26 +340,42 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
             response = await self.client.messages.create(**api_params)  # type: ignore
             logger.info("Received response from Claude API")
 
-            # Process any tool calls
-            if response.content and any(block.type == "tool_use" for block in response.content):
-                logger.info("Response contains tool calls")
+            # Single completion + at most one tool-exec round.
+            # Multi-step continuation belongs to run_agent_interactive (harness).
+            response_text = ""
+            has_tools = response.content and any(
+                block.type == "tool_use" for block in response.content
+            )
 
-                # Add assistant message with tool calls to conversation history
+            if not has_tools:
+                response_text = "".join(
+                    block.text for block in response.content if block.type == "text"
+                )
+                logger.debug(f"Response text length: {len(response_text)} chars")
+                self.conversation_history.append(
+                    {"role": "assistant", "content": response.content}
+                )
+            else:
+                logger.info("Claude tool round (single; harness continues)")
+
                 assistant_content = []
                 for block in response.content:
                     if hasattr(block, "text") and block.text is not None:
                         assistant_content.append({"type": "text", "text": block.text})  # type: ignore
                     elif block.type == "tool_use":
-                        assistant_content.append({  # type: ignore
-                            "type": "tool_use",
-                            "id": block.id,
-                            "name": block.name,
-                            "input": block.input
-                        })
+                        assistant_content.append(  # type: ignore
+                            {
+                                "type": "tool_use",
+                                "id": block.id,
+                                "name": block.name,
+                                "input": block.input,
+                            }
+                        )
 
-                self.conversation_history.append({"role": "assistant", "content": assistant_content})
+                self.conversation_history.append(
+                    {"role": "assistant", "content": assistant_content}
+                )
 
-                # Extract tool calls
                 tool_calls = []
                 for block in response.content:
                     if block.type == "tool_use":
@@ -375,101 +384,38 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
                         )
 
                 logger.info(f"Extracted {len(tool_calls)} tool calls from response")
+                tool_results, records = self._execute_tool_calls_with_records(tool_calls)
 
-                # Execute tool calls
-                tool_results = self._execute_tool_calls(tool_calls)
-
-                # Process and track tool calls for the structured response
-                for idx, tool_call in enumerate(tool_calls):
-                    tool_name = tool_call["name"]
-                    parameters = tool_call["input"]
-
-                    # Find the corresponding result
-                    result = None
-                    for res in tool_results:
-                        for content_block in res.get("content", []):
-                            if content_block.get("tool_use_id") == tool_call["id"]:
-                                result = content_block.get("content", "")
-                                break
-                        if result:
-                            break
-
-                    # Add to processed tool calls
-                    processed_tool_calls.append({
-                        "name": tool_name,
-                        "parameters": parameters,
-                        "result": result
-                    })
-
-                # Add tool results to conversation history
-                if tool_results:
-                    for result in tool_results:
-                        self.conversation_history.append(result)
-
-                    logger.debug("Making follow-up API call with tool results")
-
-                    # Make a follow-up API call with the tool results
-                    follow_up_messages = []
-                    for msg in self.conversation_history:
-                        if msg["role"] != "system" and msg.get(
-                            "content"
-                        ):  # Ensure content is not empty
-                            follow_up_messages.append(msg)
-
-                    # Make a follow-up API call with the tool results
-                    logger.debug(f"Making follow-up call with {len(follow_up_messages)} messages")
-                    follow_up_response = await self.client.messages.create(  # type: ignore
-                        model=self.model if self.model else "claude-3-5-sonnet-latest",
-                        system=self.system_prompt,  # System prompt as a separate parameter
-                        messages=follow_up_messages,
-                        max_tokens=4096,
-                        temperature=self.temperature,
-                    )
-                    logger.info("Received follow-up response from Claude API")
-
-                    # Add the assistant's follow-up response to the conversation history
-                    self.conversation_history.append(
-                        {"role": "assistant", "content": follow_up_response.content}
+                for tool_call in tool_calls:
+                    record = records.get(str(tool_call["id"]))
+                    if record is None:
+                        continue
+                    processed_tool_calls.append(
+                        build_agent_tool_call(
+                            record["name"],
+                            record["parameters"],
+                            record["normalized"],
+                            thinking=thinking,
+                            llm_content=record["llm_content"],
+                        )
                     )
 
-                    # Extract text from the response
-                    response_text = "".join(
-                        block.text for block in follow_up_response.content if block.type == "text"
-                    )
-                    logger.debug(f"Follow-up response text length: {len(response_text)} chars")
+                for result in tool_results:
+                    self.conversation_history.append(result)
 
-                    # Return structured response
-                    return {
-                        "message": response_text,
-                        "tool_calls": processed_tool_calls,
-                        "thinking": thinking
-                    }
-                else:
-                    # No valid tool results were generated
-                    error_msg = "Error: Failed to execute tool calls. Please try a different query."
-                    logger.warning("No valid tool results were generated")
-
-                    return {
-                        "message": error_msg,
-                        "tool_calls": processed_tool_calls,
-                        "thinking": thinking
-                    }
-            else:
-                # Extract text from the response
                 response_text = "".join(
                     block.text for block in response.content if block.type == "text"
                 )
-                logger.debug(f"Response text length: {len(response_text)} chars")
+                if any(
+                    is_terminate_tool(tc.get("name")) for tc in processed_tool_calls
+                ):
+                    response_text = response_text or TERMINATE_TEXT_SENTINEL
 
-                # Add the assistant's response to the conversation history
-                self.conversation_history.append({"role": "assistant", "content": response.content})
-
-                # Return structured response
-                return {
-                    "message": response_text,
-                    "tool_calls": processed_tool_calls,
-                    "thinking": thinking
-                }
+            return enrich_agent_response({
+                "message": response_text,
+                "tool_calls": processed_tool_calls,
+                "thinking": thinking,
+            })
 
         except AuthenticationError as e:
             error_msg = f"Error: Authentication failed. Please check your Anthropic API key. Details: {str(e)}"
@@ -552,9 +498,12 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
 
         try:
             # Create a message to the Claude API
+            # Use max_tokens from extra_kwargs if available, otherwise default to 2000 for structured data
+            max_tokens_value = self._resolve_max_tokens(2000)
+
             response = await self.client.messages.create(
                 model=model_to_use,
-                max_tokens=2000,
+                max_tokens=max_tokens_value,
                 system=self.system_prompt,
                 messages=[{"role": "user", "content": prompt}],
                 tools=[structured_output_tool],
@@ -690,10 +639,13 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
             # Call the Claude API
             logger.debug(f"Calling Claude API for image analysis with model: {self.model}")
 
+            # Use max_tokens from extra_kwargs if available, otherwise default to 1024 for vision
+            max_tokens_value = self._resolve_max_tokens(1024)
+
             response = await self.client.messages.create(
                 model=self.model,
                 system=image_system_prompt,
-                max_tokens=1024,
+                max_tokens=max_tokens_value,
                 temperature=self.temperature,
                 messages=[
                     {

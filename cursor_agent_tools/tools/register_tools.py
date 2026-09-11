@@ -2,10 +2,13 @@
 Utility module for registering agent tools with permission handling.
 """
 
-from typing import Any
+from typing import Any, Dict, List
 import asyncio
+import concurrent.futures
+import os
 
 from ..logger import get_logger
+from ..schemas import TERMINATE_TEXT_SENTINEL, TERMINATE_TOOL_NAME
 from . import (
     file_tools,
     search_tools,
@@ -42,7 +45,10 @@ def register_default_tools(agent: Any) -> None:
         {
             "type": "object",
             "properties": {
-                "target_file": {"type": "string", "description": "The path of the file to read"},
+                "target_file": {
+                    "type": "string",
+                    "description": "Absolute path of the file to read",
+                },
                 "offset": {
                     "type": "integer",
                     "description": "The line number to start reading from (1-indexed)",
@@ -55,6 +61,7 @@ def register_default_tools(agent: Any) -> None:
             },
             "required": ["target_file"],
         },
+        arg_aliases={"path": "target_file", "file_path": "target_file"},
     )
     logger.debug("Registered tool: read_file")
 
@@ -67,32 +74,38 @@ def register_default_tools(agent: Any) -> None:
         {
             "type": "object",
             "properties": {
-                "target_file": {"type": "string", "description": "The target file to modify"},
+                "target_file": {
+                    "type": "string",
+                    "description": "Absolute path of the file to modify",
+                },
                 "instructions": {
                     "type": "string",
                     "description": "A single sentence instruction describing the edit",
                 },
                 "code_edit": {
-                    "type": ["object", "string", "null"],
-                    "description": "Line-based edit with line ranges as keys (e.g., \"1-5\") and values as the new content.",
+                    # OpenAI-strict: single type only (no union/nullable type lists).
+                    # Optional = omitted from required; implementation still accepts dict or JSON string.
+                    "type": "object",
+                    "description": (
+                        "Line-based edit with line ranges as keys (e.g. \"1-5\") and new content as values. "
+                        "Omit this field if using code_replace instead."
+                    ),
                     "additionalProperties": {
                         "type": "string",
-                        "description": "New content for the specified line range"
+                        "description": "New content for the specified line range",
                     },
-                    "examples": [
-                        {
-                            "1-5": "def new_function():\n    return True",
-                            "10-15": "# This is a multi-line\n# comment block"
-                        }
-                    ]
                 },
                 "code_replace": {
-                    "type": ["string", "null"],
-                    "description": "Complete replacement content for the file (use this instead of code_edit for full file replacement)"
-                }
+                    "type": "string",
+                    "description": (
+                        "Complete replacement content for the file "
+                        "(use instead of code_edit for full file replacement). Omit if using code_edit."
+                    ),
+                },
             },
             "required": ["target_file", "instructions"],
         },
+        arg_aliases={"path": "target_file", "file_path": "target_file"},
     )
     logger.debug("Registered tool: edit_file")
 
@@ -103,10 +116,14 @@ def register_default_tools(agent: Any) -> None:
         {
             "type": "object",
             "properties": {
-                "target_file": {"type": "string", "description": "The path of the file to delete"},
+                "target_file": {
+                    "type": "string",
+                    "description": "Absolute path of the file to delete",
+                },
             },
             "required": ["target_file"],
         },
+        arg_aliases={"path": "target_file", "file_path": "target_file"},
     )
     logger.debug("Registered tool: delete_file")
 
@@ -119,28 +136,46 @@ def register_default_tools(agent: Any) -> None:
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Path where the file should be created",
+                    "description": "Absolute path where the file should be created",
                 },
                 "content": {"type": "string", "description": "Content to write to the file"},
             },
             "required": ["file_path", "content"],
         },
+        arg_aliases={"path": "file_path", "target_file": "file_path"},
     )
     logger.debug("Registered tool: create_file")
 
+    def _list_directory(path: str = "") -> Dict[str, Any]:
+        """List a directory; empty path defaults to the agent workspace root."""
+        resolved = path or getattr(agent, "workspace_root", "") or os.getcwd()
+        return file_tools.list_directory(resolved, agent)
+
     agent.register_tool(
         "list_directory",
-        lambda relative_workspace_path: file_tools.list_directory(relative_workspace_path, agent),
+        _list_directory,
         "List the contents of a directory.",
         {
             "type": "object",
             "properties": {
-                "relative_workspace_path": {
+                "path": {
                     "type": "string",
-                    "description": "Path to list contents of",
+                    "description": (
+                        "Absolute path of the directory to list. "
+                        "Omit to list the working directory."
+                    ),
                 },
             },
-            "required": ["relative_workspace_path"],
+            "required": [],
+        },
+        arg_aliases={
+            "directory": "path",
+            "dir": "path",
+            "directory_path": "path",
+            "target_directory": "path",
+            "folder": "path",
+            "file_path": "path",
+            "target_file": "path",
         },
     )
     logger.debug("Registered tool: list_directory")
@@ -335,10 +370,24 @@ def register_default_tools(agent: Any) -> None:
     )
     logger.debug("Registered tool: trend_search")
 
+    def _sync_query_images(query: str, image_paths: List[str]) -> Dict[str, Any]:
+        """Run async query_images from sync tool dispatch (agent chat is async)."""
+        try:
+            asyncio.get_running_loop()
+            in_loop = True
+        except RuntimeError:
+            in_loop = False
+        if not in_loop:
+            return asyncio.run(image_tools.query_images(query, image_paths, agent))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(
+                asyncio.run, image_tools.query_images(query, image_paths, agent)
+            ).result()
+
     # Image query tool
     agent.register_tool(
         "query_images",
-        lambda query, image_paths: image_tools.query_images(query, image_paths, agent),
+        _sync_query_images,
         "Query an AI model about one or more images.",
         {
             "type": "object",
@@ -357,5 +406,30 @@ def register_default_tools(agent: Any) -> None:
         },
     )
     logger.debug("Registered tool: query_images")
+
+    # Explicit session/turn exit (model decides to stop — Nova-style terminate_session)
+    def _terminate_agent_process(reason: str = "done") -> Dict[str, Any]:
+        msg = f"{TERMINATE_TEXT_SENTINEL} {reason}".strip()
+        return {"output": msg, "error": None}
+
+    agent.register_tool(
+        TERMINATE_TOOL_NAME,
+        _terminate_agent_process,
+        (
+            "End this agent session/turn when the task is finished or no further tool "
+            "work is needed. Prefer this over continuing to plan in text."
+        ),
+        {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Short reason for ending (e.g. done, blocked, partial)",
+                },
+            },
+            "required": [],
+        },
+    )
+    logger.debug("Registered tool: terminate_agent_process")
 
     logger.info(f"Successfully registered {len(agent.available_tools)} tools")

@@ -62,6 +62,46 @@ MODEL_NORMALIZATION = {
     "claude-3.5-sonnet": "claude-3-5-sonnet-latest"
 }
 
+# Models commonly served by an OpenAI-compatible Cursor gateway.
+# The package does not embed any private gateway URL — callers must set
+# CURSOR_API_BASE_URL or pass base_url=.
+CURSOR_MODEL_IDS = {
+    "auto",
+    "composer-2.5",
+    "composer-2",
+    "gpt-5.2",
+    "gpt-5.3-codex",
+    "opus-4.6-thinking",
+    "sonnet-4.5-thinking",
+    "gemini-3-pro",
+}
+
+
+def _cursor_base_url(explicit: Optional[str] = None) -> str:
+    """Resolve Cursor gateway base URL (public package: no hardcoded host)."""
+    if explicit:
+        return str(explicit).rstrip("/")
+    override = (os.getenv("CURSOR_API_BASE_URL") or "").strip()
+    if override:
+        return override.rstrip("/")
+    raise ValueError(
+        "Cursor gateway base URL not provided. Pass base_url=... or set "
+        "CURSOR_API_BASE_URL to your OpenAI-compatible Cursor endpoint."
+    )
+
+
+def _cursor_api_key(explicit: Optional[str] = None) -> str:
+    if explicit:
+        return explicit
+    return (os.getenv("CURSOR_API_KEY") or "").strip()
+
+
+def _normalize_cursor_model(model: str) -> str:
+    m = model.strip()
+    if m.startswith("cursor/") or m.startswith("cursor-"):
+        m = m.split("/", 1)[-1] if "/" in m else m[len("cursor-") :]
+    return m or "composer-2.5"
+
 
 def create_agent(
     model: str,
@@ -77,18 +117,22 @@ def create_agent(
     Create an agent based on the specified model.
 
     Args:
-        model: The name of the model to use (e.g., "gpt-4o", "claude-3-opus", "ollama-llama3")
+        model: The name of the model to use (e.g., "gpt-4o", "claude-3-opus",
+            "ollama-llama3", "composer-2.5" / "cursor/auto" for a Cursor gateway)
         api_key: The API key to use for the model provider
         temperature: The temperature to use for the model
-        timeout: The timeout in seconds for model responses
+        timeout: Hard wall-clock cap (seconds) on each LLM HTTP round-trip
         permission_callback: A callback function to handle permission requests
         permissions: Optional PermissionOptions object containing permission settings
         default_tool_timeout: Maximum execution time in seconds for tool calls (default: 300)
-        **kwargs: Additional model-specific arguments
+        **kwargs: Additional model-specific arguments. For Cursor models, pass
+            ``base_url`` (or set ``CURSOR_API_BASE_URL``) to an OpenAI-compatible
+            gateway — the package does not hardcode a private host.
 
     Returns:
         An agent instance configured with the specified parameters
     """
+    raw_model = model
     model = model.lower()  # Normalize model name to lowercase
     logger.info(f"Creating agent with model: {model}")
     logger.debug(f"Agent parameters: temperature={temperature}, timeout={timeout}, default_tool_timeout={default_tool_timeout}")
@@ -117,6 +161,39 @@ def create_agent(
             default_tool_timeout=default_tool_timeout,
             host=host,
             **kwargs
+        )
+
+    # Cursor via caller-configured OpenAI-compatible gateway
+    cursor_model = _normalize_cursor_model(model)
+    if (
+        model.startswith("cursor/")
+        or model.startswith("cursor-")
+        or cursor_model in CURSOR_MODEL_IDS
+        or kwargs.get("provider") == "cursor"
+    ):
+        logger.debug("Detected Cursor gateway model")
+        key = _cursor_api_key(api_key)
+        if not key:
+            raise ValueError(
+                "Cursor API key not provided (pass api_key=... or set CURSOR_API_KEY)"
+            )
+        explicit_base = kwargs.pop("base_url", None) or kwargs.pop("api_base", None)
+        base_url = _cursor_base_url(explicit_base)
+        kwargs.pop("provider", None)
+        kwargs.pop("host", None)
+        logger.info(
+            "Creating OpenAIAgent for Cursor model %s via %s", cursor_model, base_url
+        )
+        return OpenAIAgent(
+            model=cursor_model,
+            api_key=key,
+            temperature=temperature,
+            timeout=timeout,
+            permission_callback=permission_callback,
+            permission_options=permissions,
+            default_tool_timeout=default_tool_timeout,
+            base_url=base_url,
+            **kwargs,
         )
 
     # Handle OpenAI models
@@ -169,5 +246,5 @@ def create_agent(
 
     # Raise error for unsupported models
     else:
-        logger.error(f"Unsupported model: {model}")
-        raise ValueError(f"Unsupported model: {model}")
+        logger.error(f"Unsupported model: {raw_model}")
+        raise ValueError(f"Unsupported model: {raw_model}")

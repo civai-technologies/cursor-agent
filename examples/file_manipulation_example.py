@@ -102,8 +102,8 @@ async def run_file_manipulation_example():
                             print_info(f"   Read file: {call['parameters']['target_file']}")
                         elif call["name"] == "edit_file" and "target_file" in call["parameters"]:
                             print_info(f"   Edited file: {call['parameters']['target_file']}")
-                        elif call["name"] == "list_directory" and "relative_workspace_path" in call["parameters"]:
-                            print_info(f"   Listed directory: {call['parameters']['relative_workspace_path']}")
+                        elif call["name"] == "list_directory" and "path" in call["parameters"]:
+                            print_info(f"   Listed directory: {call['parameters']['path']}")
             else:
                 # Backward compatibility
                 print_assistant_response(response)

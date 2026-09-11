@@ -6,6 +6,11 @@ import json
 
 from .logger import get_logger
 from .permissions import PermissionManager, PermissionOptions, PermissionRequest, PermissionStatus
+from .schemas import (
+    ToolResult,
+    build_tool_event_payload,
+    normalize_tool_result,
+)
 
 
 # Initialize logger
@@ -23,19 +28,26 @@ class ToolResponse(TypedDict):
 
 
 class AgentToolCall(TypedDict):
-    """TypedDict for representing a tool call made by an agent"""
+    """Tool call made by an agent. Producers dual-emit ``result`` (legacy) and ``output``."""
+
     name: str
     parameters: Dict[str, Any]
+    result: Optional[str]
     output: str
     error: Optional[str]
     thinking: Optional[str]
 
 
-class AgentResponse(TypedDict):
-    """TypedDict for representing the response from an agent"""
+class _AgentResponseRequired(TypedDict):
     message: str
     tool_calls: List[AgentToolCall]
     thinking: Optional[str]
+
+
+class AgentResponse(_AgentResponseRequired, total=False):
+    """Structured agent response. Core fields are required; extras are additive."""
+
+    primary_tool_call: AgentToolCall
 
 
 class BaseAgent(ABC):
@@ -134,7 +146,12 @@ class BaseAgent(ABC):
         pass
 
     def register_tool(
-        self, name: str, function: Callable, description: str, parameters: Dict[str, Any]
+        self,
+        name: str,
+        function: Callable,
+        description: str,
+        parameters: Dict[str, Any],
+        arg_aliases: Optional[Dict[str, str]] = None,
     ) -> None:
         """
         Register a function that can be called by the AI.
@@ -144,10 +161,15 @@ class BaseAgent(ABC):
             function: The actual function to call
             description: Description of what the function does
             parameters: Dict describing the parameters the function takes
+            arg_aliases: Optional mapping of alternate argument keys a model
+                may send to the canonical schema key (e.g. ``{"directory":
+                "path"}``). Declared here so the tool registration owns its
+                own contract; the executor applies them generically.
         """
         self.available_tools[name] = {
             "function": function,
             "schema": {"name": name, "description": description, "parameters": parameters},
+            "arg_aliases": dict(arg_aliases or {}),
         }
         logger.debug(f"Registered tool: {name}")
 
@@ -173,6 +195,165 @@ class BaseAgent(ABC):
             List of tool call results
         """
         pass
+
+    def normalize_tool_call_arguments(
+        self, tool_name: str, arguments: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Apply registration-declared aliases, remap workspace paths, filter to schema.
+
+        The tool registration owns the argument contract: canonical keys and
+        their aliases live in ``register_tool(..., arg_aliases=)``. This
+        pipeline is generic — it never hardcodes per-tool knowledge:
+
+        1. alias keys → canonical schema keys (from registration metadata)
+        2. optional host remap hook (``remap_tool_arguments``)
+        3. filter to declared schema properties
+
+        Required-argument validation happens in ``run_registered_tool`` so a
+        missing arg becomes a structured ToolResult, never a TypeError.
+        """
+        if not isinstance(arguments, dict):
+            return {}
+        args: Dict[str, Any] = dict(arguments)
+
+        tool_meta = (getattr(self, "available_tools", None) or {}).get(tool_name) or {}
+        aliases = tool_meta.get("arg_aliases") or {}
+        for src, dst in aliases.items():
+            if src in args:
+                if dst not in args or args.get(dst) in (None, ""):
+                    args[dst] = args[src]
+                if src != dst:
+                    args.pop(src, None)
+
+        remap = getattr(self, "remap_tool_arguments", None)
+        if callable(remap):
+            try:
+                remapped = remap(args)
+                if isinstance(remapped, dict):
+                    args = remapped
+            except Exception as remap_exc:
+                logger.warning(f"Tool path remap failed: {remap_exc}")
+
+        schema = tool_meta.get("schema") or {}
+        params = schema.get("parameters") or {}
+        props = params.get("properties") if isinstance(params, dict) else None
+        if isinstance(props, dict) and props:
+            args = {k: v for k, v in args.items() if k in props}
+        return args
+
+    def _resolve_max_tokens(self, default: int) -> int:
+        """Read max_tokens from extra_kwargs with a per-call default."""
+        extra = getattr(self, "extra_kwargs", None)
+        if isinstance(extra, dict):
+            try:
+                return int(extra.get("max_tokens", default))
+            except (TypeError, ValueError):
+                return default
+        return default
+
+    def _resolve_max_tool_rounds(self, default: int = 20) -> int:
+        """Read max_tool_rounds from extra_kwargs (multi-round tool loop cap)."""
+        extra = getattr(self, "extra_kwargs", None)
+        if isinstance(extra, dict):
+            try:
+                return int(extra.get("max_tool_rounds", default))
+            except (TypeError, ValueError):
+                return default
+        return default
+
+    def notify_http_event(self, payload: Dict[str, Any]) -> None:
+        """Optional host hook for outbound LLM HTTP round-trips (start/end)."""
+        hook = getattr(self, "on_http_event", None)
+        if not callable(hook):
+            return
+        try:
+            hook(payload)
+        except Exception as hook_exc:
+            logger.debug(f"on_http_event hook failed: {hook_exc}")
+
+    def run_registered_tool(
+        self, tool_name: str, arguments: Dict[str, Any]
+    ) -> ToolResult:
+        """Execute a registered tool and emit a normalized ToolResult."""
+        args = self.normalize_tool_call_arguments(tool_name, arguments)
+        if tool_name not in self.available_tools:
+            normalized = normalize_tool_result(
+                {"error": f"Tool '{tool_name}' not found"}
+            )
+            self.notify_tool_event_normalized(tool_name, args, normalized)
+            return normalized
+
+        # Validate required schema args up front so a missing argument becomes
+        # a structured ToolResult instead of a raw TypeError from the function.
+        schema = self.available_tools[tool_name].get("schema") or {}
+        params = schema.get("parameters") or {}
+        required = params.get("required") if isinstance(params, dict) else None
+        if isinstance(required, list):
+            missing = [key for key in required if args.get(key) in (None, "")]
+            if missing:
+                normalized = normalize_tool_result(
+                    {
+                        "error": (
+                            f"{tool_name}: missing required argument(s) "
+                            + ", ".join(f"'{key}'" for key in missing)
+                        )
+                    }
+                )
+                self.notify_tool_event_normalized(tool_name, args, normalized)
+                return normalized
+
+        try:
+            function = self.available_tools[tool_name]["function"]
+            raw = function(**args)
+            normalized = normalize_tool_result(raw)
+            self.notify_tool_event_normalized(tool_name, args, normalized, raw=raw)
+            return normalized
+        except Exception as exc:
+            normalized = normalize_tool_result({"error": str(exc)})
+            self.notify_tool_event_normalized(tool_name, args, normalized)
+            return normalized
+
+    def notify_tool_event_normalized(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        normalized: ToolResult,
+        *,
+        raw: Any = None,
+    ) -> None:
+        """Emit dual-emit on_tool_event hook payload."""
+        hook = getattr(self, "on_tool_event", None)
+        if not callable(hook):
+            return
+        try:
+            hook(build_tool_event_payload(tool_name, arguments, normalized, raw=raw))
+        except Exception as hook_exc:
+            logger.debug(f"on_tool_event hook failed: {hook_exc}")
+
+    def notify_tool_event(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        *,
+        result: Any = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """Optional host hook (e.g. pods Live progress) after each tool execute."""
+        if result is not None:
+            normalized = normalize_tool_result(result)
+            if error is not None:
+                normalized = {
+                    "ok": False,
+                    "output": normalized["output"],
+                    "error": str(error),
+                    "data": normalized.get("data"),
+                }
+        elif error is not None:
+            normalized = normalize_tool_result({"error": error})
+        else:
+            normalized = normalize_tool_result({})
+        self.notify_tool_event_normalized(tool_name, arguments, normalized, raw=result)
 
     def request_permission(
         self, operation_type: str, details: Dict[str, Any]

@@ -4,6 +4,12 @@ Interactive Agent Module for cursor_agent package.
 
 This module provides functions for running interactive agent conversations,
 allowing multi-step problem solving and task completion.
+
+``user_info`` contract (injected as JSON inside ``<user_info>`` tags):
+- Harness-owned: ``workspace_path``, ``os``, session keys (``tool_calls``,
+  ``tool_results``, ``open_files``, ``file_contents``, …).
+- Consumer-owned via ``user_info_provider`` (optional): any extra keys merged
+  each iteration; consumer keys override harness defaults except session keys.
 """
 
 import os
@@ -19,6 +25,11 @@ from dotenv import load_dotenv
 from .factory import create_agent
 from .permissions import PermissionOptions
 from .logger import get_logger
+from .schemas import (
+    TERMINATE_TEXT_SENTINEL,
+    is_terminate_tool,
+    tool_call_result_value,
+)
 
 # Initialize logger
 logger = get_logger(__name__)
@@ -78,6 +89,7 @@ You have tools at your disposal to solve the coding task. Follow these rules reg
 2. NEVER call tools that are not explicitly provided.
 3. Only call tools when they are necessary. If the USER's task is general or you already know the answer, just respond without calling tools.
 4. Before calling each tool, explain to the USER why you are calling it.
+5. When you are finished with the task (or cannot progress), call the terminate_agent_process tool (or include terminate_agent_process|| in your reply). A response with no tool calls ends the turn.
 </tool_calling>
 
 <making_code_changes>
@@ -137,147 +149,63 @@ async def print_status_before_agent(message: str, details: Optional[str] = None)
 
 async def print_agent_information(agent: Any, information_type: str, content: str, details: Optional[Union[Dict[str, Any], str]] = None) -> None:
     """
-    Print formatted information from the agent to the user using AI-generated formatting.
-    Uses the agent itself to generate styling and formatting.
+    Print formatted agent status to the console (local ANSI only).
 
-    Args:
-        agent: The agent instance to use for generating formatted outpu
-        information_type: Type of information (thinking, tool_call, tool_result, plan, etc.)
-        content: The main content to display
-        details: Optional details/metadata to display (dict or string)
+    Never call ``agent.chat()`` here — nested formatting completions re-enter the
+    tool loop (and can call ``terminate_agent_process``), which looked like the
+    harness ignoring terminate.
     """
-    try:
-        # Convert details to a string representation if it's a dic
-        details_str = ""
-        if details:
-            if isinstance(details, dict):
-                details_str = "\n".join([f"{k}: {v}" for k, v in details.items()])
-            else:
-                details_str = str(details)
+    _ = agent  # kept for call-site compatibility
+    color = {
+        "thinking": Colors.GRAY,
+        "response": Colors.GREEN,
+        "error": Colors.RED,
+        "status": Colors.CYAN,
+        "tool_call": Colors.YELLOW,
+        "tool_result": Colors.YELLOW,
+        "plan": Colors.GREEN,
+        "file_operation": Colors.BLUE,
+        "command": Colors.GREEN,
+    }.get(information_type, Colors.ENDC)
 
-        # Create a temporary user info to avoid polluting the main conversation
-        temp_user_info = {"temporary_context": True, "is_formatting_request": True}
-
-        # Prepare the formatting promp
-        format_prompt = f"""Format the following "{information_type}" information for console display:
-
-CONTENT: {content}
-
-{f"DETAILS: {details_str}" if details else ""}
-
-Use ANSI color codes to style the output with appropriate colors depending on the type.
-Thinking: Gray
-Response: Green
-Error: Red
-Status: Cyan/Blue
-Tools: Yellow
-Plan: Green with numbering
-File operation: Blue
-Command: Green
-
-Return ONLY the formatted text with ANSI codes that I can directly print to the console.
-Do not include explanation text or markdown code blocks."""
-
-        # Use the agent to generate the formatted outpu
-        agent_response = await agent.chat(format_prompt, temp_user_info)
-
-        # Handle structured response
-        if isinstance(agent_response, dict):
-            formatted_output = agent_response["message"]
+    separator = "─" * 80
+    print(f"\n{separator}")
+    print(f"{color}[{information_type.upper()}]: {content}{Colors.ENDC}")
+    if details:
+        if isinstance(details, dict):
+            details_str = "\n".join([f"{k}: {v}" for k, v in details.items()])
         else:
-            formatted_output = agent_response
-
-        # Print the outpu
-        print(formatted_output)
-
-    except Exception:
-        # Fallback to basic formatting if the agent call fails
-        separator = "─" * 80
-        print(f"\n{separator}")
-        print(f"[{information_type.upper()}]: {content}")
-        if details:
-            print(f"Details: {details}")
-        print(f"{separator}")
+            details_str = str(details)
+        print(f"{color}Details: {details_str}{Colors.ENDC}")
+    print(f"{separator}")
 
 
 async def check_for_user_input_request(agent: Any, response: str) -> Union[str, bool]:
     """
-    Use the AI to determine if the agent's response is explicitly requesting user input.
+    Heuristic check whether the assistant is asking the user for input.
 
-    Args:
-        agent: The agent instance to use for analyzing the response
-        response: The response from the agen
-
-    Returns:
-        False if no input is needed, or a string containing the input prompt if needed
+    Local only — never call ``agent.chat()`` (nested meta-completions re-enter
+    the tool/terminate loop).
     """
+    _ = agent
     logger.debug("Checking if response requests user input")
-    try:
-        # Create a temporary user info to avoid polluting the main conversation
-        temp_user_info = {"temporary_context": True, "is_system_request": True}
-
-        # Ask the agent to analyze if input is needed
-        analysis_prompt = f"""Analyze the following AI assistant response and determine if it is explicitly requesting user input or clarification:
-
-RESPONSE: {response}
-
-Rules for determining if input is needed:
-1. Look for direct questions that require an answer
-2. Look for phrases like "could you provide", "can you provide", "please let me know", etc.
-3. Ignore rhetorical questions or statements where the AI says "I could" or "I will"
-4. Check for any explicit request for information, preference, decision, or guidance
-
-If user input IS needed:
-- Return a concise prompt to show the user that captures what information is being requested
-- Format it as: "INPUT_NEEDED: your prompt here"
-
-If user input is NOT needed:
-- Return only: "NO_INPUT_NEEDED"
-"""
-
-        # Get the analysis from the agen
-        logger.debug("Sending analysis prompt to agent")
-        agent_response = await agent.chat(analysis_prompt, temp_user_info)
-
-        # Handle structured response
-        if isinstance(agent_response, dict):
-            analysis = agent_response["message"]
-        else:
-            analysis = agent_response
-
-        # Process the resul
-        if "INPUT_NEEDED:" in analysis:
-            # Extract the prompt from the response
-            user_prompt = analysis.split("INPUT_NEEDED:", 1)[1].strip()
-            logger.info(f"Input needed detected: {user_prompt}")
-            return str(user_prompt)
-
-        logger.debug("No input needed detected")
-        return False
-
-    except Exception as e:
-        logger.warning(f"Error in check_for_user_input_request: {str(e)}")
-        logger.info("Falling back to simpler input detection")
-        # Fallback to simpler detection if the agent call fails
-        # Check for common phrases that indicate the agent is asking for inpu
-        input_request_phrases = [
-            "could you provide", "can you provide", "please let me know",
-            "what would you like", "how would you like", "do you have a preference"
-        ]
-
-        # Check for question marks (direct questions)
-        if "?" in response:
-            logger.info("Question mark detected in response - input needed")
+    input_request_phrases = [
+        "could you provide",
+        "can you provide",
+        "please let me know",
+        "what would you like",
+        "how would you like",
+        "do you have a preference",
+    ]
+    if "?" in (response or ""):
+        logger.info("Question mark detected in response - input needed")
+        return "Please provide the requested information:"
+    for phrase in input_request_phrases:
+        if phrase in (response or "").lower():
+            logger.info(f"Input request phrase detected: '{phrase}'")
             return "Please provide the requested information:"
-
-        # Check for common phrases that request inpu
-        for phrase in input_request_phrases:
-            if phrase in response.lower():
-                logger.info(f"Input request phrase detected: '{phrase}'")
-                return "Please provide the requested information:"
-
-        logger.debug("No input needed detected in fallback check")
-        return False
+    logger.debug("No input needed detected")
+    return False
 
 
 async def run_single_query(agent: Any, query: str, user_info: Optional[Dict[str, Any]] = None, use_custom_system_prompt: bool = False) -> Union[str, Dict[str, Any]]:
@@ -320,6 +248,52 @@ async def run_single_query(agent: Any, query: str, user_info: Optional[Dict[str,
         return f"Error processing query: {str(e)}"
 
 
+# Harness-owned session keys — always re-applied after consumer merge so a
+# user_info_provider cannot overwrite tool history or open-file accounting.
+_USER_INFO_SESSION_KEYS = (
+    "tool_calls",
+    "tool_results",
+    "open_files",
+    "file_contents",
+    "command_history",
+    "user_edits",
+    "recent_errors",
+    "cursor_position",
+)
+
+
+async def apply_user_info_provider(
+    user_info: Dict[str, Any],
+    provider: Optional[Callable[[Dict[str, Any]], Any]],
+) -> Dict[str, Any]:
+    """
+    Merge consumer extras from ``user_info_provider`` into harness ``user_info``.
+
+    Contract (producer-owned):
+    - Provider receives a shallow copy of the current user_info.
+    - Provider return dict keys override harness defaults (consumer wins).
+    - Session keys in ``_USER_INFO_SESSION_KEYS`` are always taken from the
+      harness side after merge.
+    - Sync and async providers supported; errors are logged and ignored.
+    """
+    if provider is None:
+        return user_info
+    try:
+        extras = provider(dict(user_info))
+        if asyncio.iscoroutine(extras):
+            extras = await extras
+        if not isinstance(extras, dict) or not extras:
+            return user_info
+        merged = {**user_info, **extras}
+        for key in _USER_INFO_SESSION_KEYS:
+            if key in user_info:
+                merged[key] = user_info[key]
+        return merged
+    except Exception as exc:
+        logger.warning(f"user_info_provider failed; continuing without extras: {exc}")
+        return user_info
+
+
 async def run_agent_interactive(
     model: str = "claude-3-5-sonnet-latest",
     initial_query: str = "",
@@ -330,7 +304,8 @@ async def run_agent_interactive(
     tool_call_limit: int = 25,
     agent: Optional[Any] = None,
     on_iteration: Optional[Callable[[Dict[str, Any]], None]] = None,
-    on_user_info_update: Optional[Callable[[Dict[str, Any]], None]] = None
+    on_user_info_update: Optional[Callable[[Dict[str, Any]], None]] = None,
+    user_info_provider: Optional[Callable[[Dict[str, Any]], Any]] = None,
 ) -> Union[str, Dict[str, Any]]:
     """
     Run the agent in interactive mode, allowing back-and-forth conversation.
@@ -345,7 +320,12 @@ async def run_agent_interactive(
         tool_call_limit: Maximum number of tool calls allowed throughout the entire session
         agent: Pre-configured agent instance (optional)
         on_iteration: Optional callback that receives data about each iteration
-        on_user_info_update: Optional callback that receives updated user_info
+        on_user_info_update: Observer callback; receives merged user_info each
+            iteration (after ``user_info_provider`` merge). Return value ignored.
+        user_info_provider: Optional consumer hook called each iteration after
+            ``update_workspace_state``. Return a dict of extras to merge into
+            user_info (consumer keys win; harness session keys protected).
+            Sync or async. Errors are logged; iteration continues without extras.
 
     Returns:
         A summary of the conversation outcome or structured response with details
@@ -376,7 +356,7 @@ async def run_agent_interactive(
     logger.info("Initializing conversation with task: " + (initial_query[:100] + "..." if len(initial_query) > 100 else initial_query))
 
     # Initialize detailed conversation context (similar to Cursor)
-    workspace_path = os.getcwd()
+    workspace_path = str(getattr(agent, "workspace_root", "") or "") or os.getcwd()
     user_info: Dict[str, Any] = {
         "open_files": [],  # Files currently open
         "cursor_position": None,  # Current cursor position
@@ -421,7 +401,10 @@ First, I'll create a plan for how to approach this task, then implement it step 
             # 1. Update workspace state
             user_info = update_workspace_state(user_info, created_or_modified_files)
 
-            # Invoke callback with updated user_info if provided
+            # 2. Consumer extras (git, file tree, etc.) merged before observer/query
+            user_info = await apply_user_info_provider(user_info, user_info_provider)
+
+            # 3. Observer receives merged user_info
             if on_user_info_update:
                 logger.info(f"Calling on_user_info_update callback with user_info: {user_info}")
                 try:
@@ -460,14 +443,34 @@ First, I'll create a plan for how to approach this task, then implement it step 
                 await print_agent_information(agent, "status", f"Session ended after reaching tool call limit ({total_tool_calls}/{tool_call_limit})")
                 break
 
-            # Check if we made tool calls in this iteration
-            if len(tool_calls) > 0:
-                logger.info(f"Made {len(tool_calls)} tool calls, will add to max_iterations")
-                await print_agent_information(agent, "status", f"Made {len(tool_calls)} tool calls, will increase the max_iterations to {max_iterations + 1}")
-                max_iterations += 1
+            # 5. Determine next steps (AI exit: terminate tool/protocol, or no tool_calls)
+            next_action = await determine_next_steps(
+                agent, response, auto_continue, iteration, tool_calls=tool_calls
+            )
 
-            # 5. Determine next steps
-            next_action = await determine_next_steps(agent, response, auto_continue, iteration)
+            # Emit iteration progress before COMPLETE break so hosts see the last turn
+            if on_iteration:
+                next_action_data = {
+                    "action_type": next_action.action_type.name,
+                    "prompt": next_action.prompt,
+                }
+                iteration_data = {
+                    "iteration": iteration,
+                    "query": query,
+                    "response": response,
+                    "agent_response": agent_response,
+                    "tool_calls": tool_calls,
+                    "total_tool_calls": total_tool_calls,
+                    "next_action": next_action_data,
+                }
+                logger.info(f"Calling on_iteration callback with iteration data: {iteration_data}")
+                try:
+                    if asyncio.iscoroutinefunction(on_iteration):
+                        await on_iteration(iteration_data)
+                    else:
+                        on_iteration(iteration_data)
+                except Exception as callback_error:
+                    logger.warning(f"Error in on_iteration callback: {callback_error}")
 
             # 6. Handle different next actions
             if next_action.action_type == ActionType.COMPLETE:
@@ -476,20 +479,20 @@ First, I'll create a plan for how to approach this task, then implement it step 
                 break
 
             elif next_action.action_type == ActionType.AUTO_CONTINUE:
-                # Auto-continue to next step
-                query = await get_continuation_prompt(agent, iteration, response, auto_continue_prompt)
+                # Mechanical continue — no nested meta-LLM (avoids hang when provider is idle)
+                query = await get_continuation_prompt(
+                    agent, iteration, response, auto_continue_prompt
+                )
                 await print_agent_information(agent, "status", "Automatically continuing to next step...")
                 await asyncio.sleep(loop_delay)  # Brief pause for readability
 
             elif next_action.action_type == ActionType.USER_INPUT:
-                # Get user input and create continuation
                 user_input = await get_user_input(next_action.prompt)
                 query = await get_continuation_prompt(agent, iteration, response, user_input)
                 iteration += 1
                 continue
 
             elif next_action.action_type == ActionType.MANUAL_CONTINUE:
-                # Get user direction for continuation
                 await print_agent_information(agent, "response", "How can I help you further with this task? Please provide any guidance or specific requests.")
                 user_input = await get_user_input(next_action.prompt)
                 query = await get_continuation_prompt(agent, iteration, response, user_input)
@@ -501,34 +504,6 @@ First, I'll create a plan for how to approach this task, then implement it step 
 
             # 8. Show progress messages
             await show_progress_messages(agent, auto_continue, response, iteration, max_iterations)
-
-            # Invoke iteration callback if provided
-            if on_iteration:
-                # Convert NextAction to a serializable representation
-                next_action_data = {
-                    "action_type": next_action.action_type.name,
-                    "prompt": next_action.prompt
-                }
-
-                iteration_data = {
-                    "iteration": iteration,
-                    "query": query,
-                    "response": response,
-                    "agent_response": agent_response,
-                    "tool_calls": tool_calls,
-                    "total_tool_calls": total_tool_calls,
-                    "next_action": next_action_data
-                }
-
-                logger.info(f"Calling on_iteration callback with iteration data: {iteration_data}")
-                try:
-                    # Check if the callback is a coroutine function
-                    if asyncio.iscoroutinefunction(on_iteration):
-                        await on_iteration(iteration_data)
-                    else:
-                        on_iteration(iteration_data)
-                except Exception as callback_error:
-                    logger.warning(f"Error in on_iteration callback: {callback_error}")
 
             iteration += 1
 
@@ -560,6 +535,7 @@ First, I'll create a plan for how to approach this task, then implement it step 
             "message": final_message,
             "iterations": iteration - 1,
             "tool_calls": total_tool_calls,
+            "tool_call_count": total_tool_calls,
             "user_info": user_info,
             "files_modified": list(created_or_modified_files),
             "final_response": agent_response if 'agent_response' in locals() else None
@@ -571,6 +547,7 @@ First, I'll create a plan for how to approach this task, then implement it step 
             "message": final_message,
             "iterations": iteration - 1,
             "tool_calls": total_tool_calls or 0,
+            "tool_call_count": total_tool_calls or 0,
             "user_info": user_info or {},
             "files_modified": list(created_or_modified_files) or [],
             "final_response": agent_response if 'agent_response' in locals() else None
@@ -657,13 +634,21 @@ def is_task_complete(response: str) -> bool:
     """
     Analyze if the response suggests the task is complete.
 
-    Args:
-        response: The response from the agen
-
-    Returns:
-        True if the task appears to be complete, False otherwise
+    Primary signal: explicit terminate_agent_process protocol (pods / harness).
+    Secondary: common completion phrases (legacy heuristic).
     """
     logger.debug("Checking if task is complete based on agent response")
+
+    if not response:
+        return False
+
+    response_lower = response.lower()
+
+    # First-class exit protocol (AI-decided stop) — exact sentinel, so merely
+    # mentioning the tool name in prose does not end the session.
+    if TERMINATE_TEXT_SENTINEL in response_lower:
+        logger.info("Task completion detected: terminate_agent_process protocol")
+        return True
 
     # Look for various forms of task completion statements
     completion_indicators = [
@@ -678,8 +663,6 @@ def is_task_complete(response: str) -> bool:
         "everything is now implemented",
         "all features are now implemented",
     ]
-
-    response_lower = response.lower()
 
     # Check for completion indicators with additional context check
     # (Cursor does more sophisticated analysis)
@@ -711,63 +694,47 @@ def is_task_complete(response: str) -> bool:
     return False
 
 
+def _tool_name(tool_call: Dict[str, Any]) -> str:
+    return str(tool_call.get("tool") or tool_call.get("name") or "")
+
+
+def _has_terminate_tool(tool_calls: List[Dict[str, Any]]) -> bool:
+    return any(is_terminate_tool(_tool_name(tc)) for tc in tool_calls)
+
+
+def _work_tool_calls(tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Tool calls that perform work (excludes explicit terminate)."""
+    return [tc for tc in tool_calls if not is_terminate_tool(_tool_name(tc))]
+
+
 async def get_continuation_prompt(agent: Any, iteration: int, last_response: str, user_input: Optional[str] = None) -> str:
     """
-    Generate a continuation prompt for the next iteration.
+    Build a mechanical continuation prompt (no nested LLM call).
 
-    Args:
-        agent: The agent instance
-        iteration: Current iteration number
-        last_response: Last response from the agen
-        user_input: Optional user input to incorporate
-
-    Returns:
-        A prompt string for the agent to continue
+    Nested meta-chats hang the harness when the provider is idle; continue strings
+    must be local and bounded.
     """
-    try:
-        # Create a temporary user info to avoid polluting the main conversation
-        temp_user_info = {"temporary_context": True, "is_system_request": True}
-
-        # Prepare the analysis prompt to determine the best continuation approach
-        analysis_prompt = f"""You're helping implement a multi-step solution. Review the current status and determine how to continue.
-
-    Current iteration: {iteration}
-    Last response:
-    {last_response}
-
-    {f"User input for continuation: {user_input}" if user_input else "No additional user input provided."}
-
-    What's the best continuation prompt for the next iteration? Consider:
-    1. Summarize progress so far
-    2. Identify next steps based on current status
-    3. Incorporate any user inpu
-    4. Frame the prompt to move the task forward
-
-    Return ONLY the continuation prompt itself with no additional explanations or meta-text.
-    """
-
-        # Get the continuation prompt from the agen
-        agent_response = await agent.chat(analysis_prompt, temp_user_info)
-
-        # Handle structured response
-        if isinstance(agent_response, dict):
-            continuation_prompt: str = agent_response["message"]
-        else:
-            continuation_prompt = str(agent_response)
-
-        # If user input was provided, make sure it's incorporated
-        if user_input and user_input not in continuation_prompt:
-            continuation_prompt = f"The user has provided the following input: '{user_input}'\n\n{continuation_prompt}"
-
-        await print_agent_information(agent, "status", "Continuation prompt prepared for next iteration", continuation_prompt[:100] + "..." if len(continuation_prompt) > 100 else continuation_prompt)
-
-        return continuation_prompt
-
-    except Exception as ex:
-        # If there's an error getting a continuation prompt, just return a simple fallback
-        print(f"Error getting continuation prompt: {str(ex)}")
-        # Return a default continuation promp
-        return "Continue with the next steps based on the previous results."
+    default = (
+        "Continue with the next concrete step. Use tools when you need to change "
+        "files or run commands. When finished, call terminate_agent_process "
+        "(or reply with terminate_agent_process||). A reply with no tool calls ends the turn."
+    )
+    direction = (user_input or "").strip() or default
+    snippet = (last_response or "").strip()
+    if len(snippet) > 2500:
+        snippet = snippet[:2500] + "\n..."
+    prompt = (
+        f"{direction}\n\n"
+        f"(iteration {iteration})\n"
+        f"Previous assistant output (context):\n{snippet}"
+    )
+    await print_agent_information(
+        agent,
+        "status",
+        "Continuation prompt prepared for next iteration",
+        prompt[:100] + "..." if len(prompt) > 100 else prompt,
+    )
+    return prompt
 
 
 def update_workspace_state(user_info: Dict[str, Any], created_or_modified_files: set) -> Dict[str, Any]:
@@ -936,7 +903,7 @@ async def process_tool_calls(
             tool_calls.append({
                 "tool": tc["name"],
                 "args": tc["parameters"],
-                "result": tc["result"]
+                "result": tool_call_result_value(tc),
             })
     else:
         # It's a string response, need to extract tool calls from tex
@@ -994,6 +961,14 @@ async def process_tool_calls(
     return total_tool_calls, tool_calls
 
 
+def _can_prompt_stdin() -> bool:
+    """True only when an interactive terminal can answer prompts."""
+    try:
+        return bool(sys.stdin and sys.stdin.isatty())
+    except Exception:
+        return False
+
+
 async def check_tool_call_limits(
     agent: Any,
     total_tool_calls: int,
@@ -1002,13 +977,7 @@ async def check_tool_call_limits(
     """
     Check if the tool call limit has been reached and ask the user whether to continue.
 
-    Args:
-        agent: The agent instance
-        total_tool_calls: Total count of tool calls across all iterations
-        tool_call_limit: Maximum allowed tool calls for the entire session
-
-    Returns:
-        True if continue_processing, False if end_session
+    Headless/non-TTY: stop at the limit (do not block on stdin).
     """
     logger.debug(f"Checking tool call limits: current={total_tool_calls}, max={tool_call_limit}")
 
@@ -1019,6 +988,15 @@ async def check_tool_call_limits(
             "status",
             f"Reached maximum of {tool_call_limit} total tool calls for this session"
         )
+        if not _can_prompt_stdin():
+            logger.info("No TTY — ending session at tool call limit (headless)")
+            await print_agent_information(
+                agent,
+                "status",
+                "Headless mode: stopping at tool call limit without prompting.",
+            )
+            return False
+
         print(f"\n{Colors.YELLOW}The agent has made {total_tool_calls} total tool calls in this session.{Colors.ENDC}")
         print(f"{Colors.YELLOW}Would you like to continue allowing the agent to make more changes?{Colors.ENDC}")
         choice = input(f"{Colors.GREEN}Continue? (y/n): {Colors.ENDC}")
@@ -1048,13 +1026,12 @@ async def get_user_input(prompt: str) -> str:
     """
     Get input from the user with colorized prompt.
 
-    Args:
-        prompt: The prompt to display to the user
-
-    Returns:
-        The user's inpu
+    Headless/non-TTY: return a mechanical continue string (never block on stdin).
     """
     logger.info(f"Requesting user input with prompt: {prompt}")
+    if not _can_prompt_stdin():
+        logger.warning("No TTY for user input — using mechanical continue")
+        return "continue"
     user_input = input(f"{Colors.GREEN}{prompt} {Colors.ENDC}")
     logger.debug(f"Received user input: {user_input}")
     return user_input
@@ -1115,25 +1092,35 @@ async def determine_next_steps(
     agent: Any,
     response: str,
     auto_continue: bool,
-    iteration: int
+    iteration: int,
+    tool_calls: Optional[List[Dict[str, Any]]] = None,
 ) -> NextAction:
     """
-    Determine the next steps based on the agent's response.
+    Determine the next steps based on the agent's response and tool use.
 
-    Args:
-        agent: The agent instance
-        response: The response from the agen
-        auto_continue: Whether auto-continue is enabled
-        iteration: Current iteration number
-
-    Returns:
-        A NextAction instance indicating what to do nex
+    Exit rules (AI-decided turn end, aligned with Nova terminate + SecOps no-tools):
+    1. terminate_agent_process tool or terminate_agent_process|| text → COMPLETE
+    2. No work tool_calls this turn → COMPLETE (model ended the turn)
+    3. Else auto_continue → AUTO_CONTINUE; else prompt user
+    max_iterations remains the outer safety net.
     """
     logger.debug(f"Determining next steps for iteration {iteration}")
+    tool_calls = tool_calls or []
 
-    # Check if task is complete
-    if is_task_complete(response):
+    if is_task_complete(response) or _has_terminate_tool(tool_calls):
         logger.info("Task completion detected - ending interactive session")
+        return NextAction(ActionType.COMPLETE)
+
+    work_tools = _work_tool_calls(tool_calls)
+    if len(work_tools) == 0:
+        logger.info(
+            "No work tool calls this turn - ending interactive session (model ended turn)"
+        )
+        await print_agent_information(
+            agent,
+            "status",
+            "No tool calls this turn; ending session (model decided to stop).",
+        )
         return NextAction(ActionType.COMPLETE)
 
     # Determine continuation based on mode
@@ -1178,6 +1165,10 @@ async def handle_iteration_error(
 
     await print_agent_information(agent, "error", f"Error in iteration {iteration}", str(error))
     user_info["recent_errors"].append(str(error))
+
+    if not _can_prompt_stdin():
+        logger.info("No TTY — continuing with error information (headless)")
+        return "CONTINUE_WITH_ERROR"
 
     print(f"\n{Colors.YELLOW}Options:{Colors.ENDC}")
     print(f"{Colors.YELLOW}1. Retry this iteration{Colors.ENDC}")

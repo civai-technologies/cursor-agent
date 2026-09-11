@@ -59,6 +59,52 @@ This document outlines the constraints of the AI Agent implementation and provid
 - **Constraint**: Tool execution errors may interrupt the agent's flow.
 - **Workaround**: Each tool function has comprehensive try/except blocks and returns structured error responses.
 
+## Tool output contracts (v0.1.40+)
+
+Producers own the contract at agent boundaries. Direct tool imports keep legacy shapes; agents normalize and dual-emit.
+
+### Cursor provider (OpenAI-compatible gateway)
+
+Cursor models (`provider="cursor"`, `cursor/…`, or known ids like `composer-2.5`) use `OpenAIAgent` against a **caller-configured** gateway:
+
+- **Required:** `base_url=` **or** env `CURSOR_API_BASE_URL`
+- **Auth:** `api_key=` **or** env `CURSOR_API_KEY`
+
+This package does **not** hardcode a private/host-specific gateway URL. Host apps (e.g. pods) own their endpoint wiring.
+
+### Direct tool functions (unchanged for backward compatibility)
+
+| Tool | Success shape | Error shape |
+|------|---------------|-------------|
+| `read_file` | `{content, start_line, end_line, total_lines, ...}` | `{error: str}` |
+| `edit_file` / `delete_file` | `{status: "success", message}` | `{status: "error", message}` |
+| `web_search` | `{ok, skipped?, results: [{title, url, content}], query?, total_results?}` | `{ok: false, error, results: []}` |
+| `query_images` | `{result: str}` | `{error: str}` |
+
+### `agent.chat()` → `tool_calls[]` entry (dual-emit)
+
+```json
+{
+  "name": "my_tool",
+  "parameters": {},
+  "result": "<legacy LLM-facing string — audience-resolver reads this>",
+  "output": "<canonical serialized output>",
+  "error": null,
+  "thinking": null
+}
+```
+
+Optional top-level `primary_tool_call` points at the **last** tool in multi-round sessions.
+
+### `on_tool_event` hook payload (dual-emit)
+
+Legacy: `tool`, `name`, `args`, `parameters`, `result`, `error`  
+Canonical: `tool_name`, `arguments`, `output`, `ok`
+
+### `run_agent_interactive` session return
+
+`tool_calls` remains an **int** count (legacy). `tool_call_count` is the same value (alias).
+
 ## Concurrent Usage Constraints
 
 ### Async Implementation Limitations

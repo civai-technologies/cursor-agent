@@ -1,10 +1,19 @@
 # mypy: ignore-errors
+import asyncio
 import json
+import time
 from typing import Any, Dict, List, Optional, Callable, cast, Union
 
 from openai import AsyncOpenAI, BadRequestError, RateLimitError, APIError, AuthenticationError
 
 from .base import BaseAgent, AgentResponse, AgentToolCall
+from .schemas import (
+    TERMINATE_TEXT_SENTINEL,
+    build_agent_tool_call,
+    enrich_agent_response,
+    is_terminate_tool,
+    llm_tool_content,
+)
 from .logger import get_logger
 from .permissions import PermissionOptions, PermissionRequest, PermissionStatus
 from .tools.register_tools import register_default_tools
@@ -36,7 +45,7 @@ class OpenAIAgent(BaseAgent):
             api_key: OpenAI API key
             model: OpenAI model to use, default is gpt-4-turbo
             temperature: Temperature parameter for model (0.0 to 1.0)
-            timeout: Timeout in seconds for API requests
+            timeout: Hard wall-clock cap (seconds) on each LLM HTTP round-trip
             permission_callback: Optional callback for permission requests
             permission_options: Permission configuration options
             default_tool_timeout: Default timeout in seconds for tool calls (default: 300s)
@@ -55,17 +64,20 @@ class OpenAIAgent(BaseAgent):
         self.temperature = temperature
         self.timeout = timeout
         self.extra_kwargs = kwargs
+        # Optional OpenAI-compatible gateway (pass base_url= or CURSOR_API_BASE_URL)
+        self.base_url = kwargs.pop("base_url", None) or kwargs.pop("api_base", None)
 
         # Initialize OpenAI client
         try:
             # Create a custom httpx client first to avoid proxies parameter issue
             import httpx
-            http_client = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+            http_client = httpx.AsyncClient(follow_redirects=True)
+            client_kwargs = {"api_key": api_key, "http_client": http_client}
+            if self.base_url:
+                client_kwargs["base_url"] = str(self.base_url).rstrip("/")
+                logger.info(f"Using OpenAI-compatible base_url: {client_kwargs['base_url']}")
             # Initialize with custom client to avoid proxies issue
-            self.client = AsyncOpenAI(
-                api_key=api_key,
-                http_client=http_client
-            )
+            self.client = AsyncOpenAI(**client_kwargs)
             logger.debug("Initialized OpenAI client")
         except Exception as e:
             # Handle errors from incompatible package versions
@@ -82,6 +94,65 @@ class OpenAIAgent(BaseAgent):
         self.system_prompt = self._generate_system_prompt()
         logger.debug(f"Generated system prompt ({len(self.system_prompt)} chars)")
         logger.debug(f"Tool timeouts set to {default_tool_timeout}s")
+
+    async def _await_llm(self, coro: Any) -> Any:
+        """Hard wall-clock cap — not httpx idle read timeout."""
+        try:
+            return await asyncio.wait_for(coro, timeout=float(self.timeout))
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"LLM request timed out after {self.timeout}s"
+            ) from exc
+
+    async def _chat_completions_create(self, *, kind: str = "chat", **create_kwargs: Any) -> Any:
+        """POST chat/completions and emit start/end hooks for Live progress."""
+        model = create_kwargs.get("model") or self.model or "unknown"
+        base = getattr(self, "base_url", None) or "https://api.openai.com/v1"
+        path = f"{str(base).rstrip('/')}/chat/completions"
+        self.notify_http_event(
+            {
+                "phase": "start",
+                "kind": kind,
+                "method": "POST",
+                "path": path,
+                "model": model,
+            }
+        )
+        t0 = time.time()
+        try:
+            create_kwargs.pop("timeout", None)
+            response = await self._await_llm(
+                self.client.chat.completions.create(**create_kwargs)
+            )
+            elapsed = time.time() - t0
+            self.notify_http_event(
+                {
+                    "phase": "end",
+                    "kind": kind,
+                    "method": "POST",
+                    "path": path,
+                    "model": model,
+                    "status": 200,
+                    "elapsed_s": elapsed,
+                }
+            )
+            return response
+        except Exception as exc:
+            elapsed = time.time() - t0
+            status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+            self.notify_http_event(
+                {
+                    "phase": "end",
+                    "kind": kind,
+                    "method": "POST",
+                    "path": path,
+                    "model": model,
+                    "status": status or "error",
+                    "elapsed_s": elapsed,
+                    "error": str(exc)[:240],
+                }
+            )
+            raise
 
     def _is_valid_api_key(self, api_key: str) -> bool:
         """
@@ -203,80 +274,65 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
         Returns:
             List of tool call results
         """
+        results, _records = self._execute_tool_calls_with_records(tool_calls)
+        return results
+
+    def _execute_tool_calls_with_records(
+        self, tool_calls: Any
+    ) -> tuple:
+        """Execute tool calls; return (api tool messages, records keyed by call id).
+
+        Records carry the normalized ToolResult so the chat loop can build
+        dual-emit AgentToolCall entries without re-running tools.
+        """
         logger.info(f"Executing {len(tool_calls)} tool calls")
-        tool_results = []
+        tool_results: List[Dict[str, Any]] = []
+        records: Dict[str, Dict[str, Any]] = {}
 
         for call in tool_calls:
+            # Handle both dict format and ChatCompletionMessageToolCall objects
+            if hasattr(call, "function"):
+                tool_name = call.function.name
+                raw_arguments = call.function.arguments
+                tool_call_id = call.id
+            else:
+                tool_name = call["function"]["name"]
+                raw_arguments = call["function"]["arguments"]
+                tool_call_id = cast(str, call.get("id", "unknown_id"))
+
             try:
-                # Handle both dict format and ChatCompletionMessageToolCall objects
-                if hasattr(call, "function"):
-                    # It's an object
-                    tool_name = call.function.name
-                    try:
-                        arguments = json.loads(call.function.arguments)
-                    except json.JSONDecodeError:
-                        arguments = {}
-                    tool_call_id = call.id
-                    logger.debug(f"Executing tool (object): {tool_name} (id: {tool_call_id})")
-                else:
-                    # It's a dict
-                    tool_name = call["function"]["name"]
-                    try:
-                        arguments = json.loads(call["function"]["arguments"])
-                    except json.JSONDecodeError:
-                        arguments = {}
-                    # Cast to str to handle potential missing 'id' attribute
-                    tool_call_id = cast(str, call.get("id", "unknown_id"))
-                    logger.debug(f"Executing tool (dict): {tool_name} (id: {tool_call_id})")
+                arguments = json.loads(raw_arguments)
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
 
-                logger.debug(f"Tool arguments: {json.dumps(arguments)}")
+            logger.debug(f"Executing tool: {tool_name} (id: {tool_call_id})")
+            normalized = self.run_registered_tool(tool_name, arguments)
+            content = llm_tool_content(normalized)
 
-                if tool_name not in self.available_tools:
-                    logger.warning(f"Tool not found: {tool_name}")
-                    result = {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": f"Error: Tool '{tool_name}' not found",
-                    }
-                else:
-                    logger.debug(f"Calling function for tool: {tool_name}")
-                    function = self.available_tools[tool_name]["function"]
-                    result_content = function(**arguments)
+            if not normalized["ok"]:
+                logger.warning(f"Tool {tool_name} returned error: {normalized.get('error')}")
+            else:
+                content_preview = content[:100] + "..." if len(content) > 100 else content
+                logger.debug(f"Tool {tool_name} result: {content_preview}")
 
-                    # Log a summary of the result
-                    if isinstance(result_content, dict) and "error" in result_content:
-                        logger.warning(f"Tool {tool_name} returned error: {result_content.get('error')}")
-                    else:
-                        content_preview = str(result_content)
-                        if len(content_preview) > 100:
-                            content_preview = content_preview[:100] + "..."
-                        logger.debug(f"Tool {tool_name} result: {content_preview}")
-
-                    result = {
-                        "role": "tool",
-                        "tool_call_id": tool_call_id,
-                        "content": (
-                            json.dumps(result_content)
-                            if isinstance(result_content, dict)
-                            else str(result_content)
-                        ),
-                    }
-                tool_results.append(result)
-            except Exception as e:
-                # Log the error - in production, this would go to a proper logging system
-                logger.error(f"Error executing tool call: {str(e)}")
-                # We still need to add a response to maintain the conversation flow
-                if "tool_call_id" in locals():
-                    tool_results.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": tool_call_id,  # type: ignore
-                            "content": f"Error: {str(e)}",
-                        }
-                    )
+            tool_results.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": content,
+                }
+            )
+            records[str(tool_call_id)] = {
+                "name": tool_name,
+                "parameters": arguments,
+                "normalized": normalized,
+                "llm_content": content,
+            }
 
         logger.info(f"Completed {len(tool_results)} tool call results")
-        return tool_results
+        return tool_results, records
 
     async def chat(self, message: str, user_info: Optional[Dict[str, Any]] = None) -> Union[str, AgentResponse]:
         """
@@ -295,6 +351,18 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
 
         logger.info("Sending message to OpenAI API")
         logger.debug(f"Message length: {len(formatted_message)} chars")
+
+        waiting_hook = getattr(self, "on_llm_waiting", None)
+        if callable(waiting_hook):
+            try:
+                waiting_hook(
+                    {
+                        "model": self.model,
+                        "message_chars": len(formatted_message),
+                    }
+                )
+            except Exception as wait_exc:
+                logger.debug(f"on_llm_waiting hook failed: {wait_exc}")
 
         # Add the user message to the conversation history
         self.conversation_history.append({"role": "user", "content": formatted_message})
@@ -315,12 +383,16 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
             if tools:
                 logger.debug(f"Using {len(tools)} tools")
 
-            response = await self.client.chat.completions.create(  # type: ignore
+            # Use max_tokens from extra_kwargs if available, otherwise default to 4096
+            max_tokens_value = self._resolve_max_tokens(4096)
+
+            response = await self._chat_completions_create(
+                kind="chat",
                 model=self.model if self.model else "gpt-4-turbo",
                 messages=messages,
                 tools=tools,
                 tool_choice="auto" if tools else None,
-                max_tokens=4096,
+                max_tokens=max_tokens_value,
                 temperature=self.temperature,
             )
             logger.info("Received response from OpenAI API")
@@ -331,108 +403,83 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
             # Track thinking (not directly supported by OpenAI but we can add it in the future)
             thinking = None
 
-            # Check if there are any tool calls
-            if assistant_message.tool_calls:
-                logger.info(f"Response contains {len(assistant_message.tool_calls)} tool calls")
+            # Single completion + at most one tool-exec round.
+            # Multi-step tool continuation belongs to run_agent_interactive
+            # (harness), not an inner follow-up loop inside chat().
+            llm_hook = getattr(self, "on_llm_event", None)
+            if callable(llm_hook) and (assistant_message.content or assistant_message.tool_calls):
+                try:
+                    llm_hook(
+                        {
+                            "message": assistant_message.content or "",
+                            "tool_call_count": len(assistant_message.tool_calls or []),
+                        }
+                    )
+                except Exception as llm_hook_exc:
+                    logger.debug(f"on_llm_event hook failed: {llm_hook_exc}")
 
-                # Add the assistant's response to the conversation history
+            response_text = assistant_message.content or ""
+
+            if not assistant_message.tool_calls:
+                self.conversation_history.append(
+                    {"role": "assistant", "content": assistant_message.content}
+                )
+                logger.debug(f"Response text length: {len(response_text)} chars")
+            else:
+                logger.info(
+                    "Executing %s tool call(s) (single round; harness continues)",
+                    len(assistant_message.tool_calls),
+                )
                 self.conversation_history.append(
                     {
                         "role": "assistant",
                         "content": assistant_message.content or "",
-                        "tool_calls": assistant_message.tool_calls,
+                        "tool_calls": [
+                            {
+                                "id": tool_call.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call.function.name,
+                                    "arguments": tool_call.function.arguments,
+                                },
+                            }
+                            for tool_call in assistant_message.tool_calls
+                        ],
                     }
                 )
 
-                # Execute the tool calls
-                tool_results = self._execute_tool_calls(assistant_message.tool_calls)
+                tool_results, records = self._execute_tool_calls_with_records(
+                    assistant_message.tool_calls
+                )
+                for tool_call in assistant_message.tool_calls:
+                    record = records.get(str(tool_call.id))
+                    if record is None:
+                        continue
+                    processed_tool_calls.append(
+                        build_agent_tool_call(
+                            record["name"],
+                            record["parameters"],
+                            record["normalized"],
+                            thinking=thinking,
+                            llm_content=record["llm_content"],
+                        )
+                    )
 
-                # Process and track tool calls for the structured response
-                for idx, tool_call in enumerate(assistant_message.tool_calls):
-                    tool_name = tool_call.function.name
-                    try:
-                        parameters = json.loads(tool_call.function.arguments)
-                    except json.JSONDecodeError:
-                        parameters = {}
-
-                    # Find the corresponding result
-                    result = None
-                    for res in tool_results:
-                        if res.get("tool_call_id") == tool_call.id:
-                            result = res.get("content", "")
-                            break
-
-                    # Add to processed tool calls
-                    processed_tool_calls.append({
-                        "name": tool_name,
-                        "parameters": parameters,
-                        "result": result
-                    })
-
-                # Add the tool results to the conversation history
                 for result in tool_results:
                     self.conversation_history.append(result)
 
-                # Make a follow-up API call with the tool results
-                logger.debug("Making follow-up API call with tool results")
-                follow_up_messages = (
-                    messages
-                    + [
-                        {
-                            "role": "assistant",
-                            "content": assistant_message.content or "",
-                            "tool_calls": [
-                                {
-                                    "id": tool_call.id,
-                                    "function": {
-                                        "name": tool_call.function.name,
-                                        "arguments": tool_call.function.arguments,
-                                    },
-                                    "type": "function",
-                                }
-                                for tool_call in assistant_message.tool_calls
-                            ],
-                        }
-                    ]
-                    + tool_results
-                )
-                logger.debug(f"Follow-up call with {len(follow_up_messages)} messages")
+                # Preserve terminate protocol in returned message when model only
+                # emitted the tool call (no assistant text).
+                if any(
+                    is_terminate_tool(tc.get("name")) for tc in processed_tool_calls
+                ):
+                    response_text = response_text or TERMINATE_TEXT_SENTINEL
 
-                follow_up_response = await self.client.chat.completions.create(
-                    model=self.model if self.model else "gpt-4-turbo", messages=follow_up_messages, max_tokens=4096, temperature=self.temperature
-                )
-                logger.info("Received follow-up response from OpenAI API")
-
-                # Add the assistant's follow-up response to the conversation history
-                follow_up_message = follow_up_response.choices[0].message
-                self.conversation_history.append(
-                    {"role": "assistant", "content": follow_up_message.content}
-                )
-
-                response_text = follow_up_message.content or ""
-                logger.debug(f"Follow-up response text length: {len(response_text)} chars")
-
-                # Return structured response
-                return {
-                    "message": response_text,
-                    "tool_calls": processed_tool_calls,
-                    "thinking": thinking
-                }
-            else:
-                # Add the assistant's response to the conversation history
-                self.conversation_history.append(
-                    {"role": "assistant", "content": assistant_message.content}
-                )
-
-                response_text = assistant_message.content or ""
-                logger.debug(f"Response text length: {len(response_text)} chars")
-
-                # Return structured response
-                return {
-                    "message": response_text,
-                    "tool_calls": processed_tool_calls,
-                    "thinking": thinking
-                }
+            return enrich_agent_response({
+                "message": response_text,
+                "tool_calls": processed_tool_calls,
+                "thinking": thinking,
+            })
 
         except AuthenticationError as e:
             error_msg = f"Error: Authentication failed. Please check your OpenAI API key. Details: {str(e)}"
@@ -517,16 +564,20 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
             ]
 
             # Create a completion request to the OpenAI API with tools
-            response = await self.client.chat.completions.create(
+            # Use max_tokens from extra_kwargs if available, otherwise default to 2000 for structured data
+            max_tokens_value = self._resolve_max_tokens(2000)
+
+            response = await self._chat_completions_create(
+                kind="structured",
                 model=model_to_use,
-                max_tokens=2000,
+                max_tokens=max_tokens_value,
                 messages=[
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": prompt}
                 ],
                 tools=tools,
                 tool_choice={"type": "function", "function": {"name": "get_structured_data"}},
-                temperature=0
+                temperature=0,
             )
 
             # Extract the JSON content from the function call
@@ -661,12 +712,15 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
             logger.debug(f"Calling OpenAI API for image analysis with model: {self.model}")
             vision_model = "gpt-4o" if self.model.startswith("gpt-4") else "gpt-4o"
 
-            response = await self.client.chat.completions.create(
+            # Use max_tokens from extra_kwargs if available, otherwise default to 1024 for vision
+            max_tokens_value = self._resolve_max_tokens(1024)
+
+            response = await self._chat_completions_create(
+                kind="vision",
                 model=vision_model,
                 messages=messages,
-                max_tokens=1024,
+                max_tokens=max_tokens_value,
                 temperature=self.temperature,
-                timeout=self.timeout
             )
 
             # Extract and return the assistant's response

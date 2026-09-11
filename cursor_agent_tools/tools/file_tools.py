@@ -316,14 +316,15 @@ def create_file(
 
 
 def list_directory(
-    relative_workspace_path: str,
+    path: str,
     agent: Optional[BaseAgent] = None,  # Optional agent reference for permissions
 ) -> Dict[str, Any]:
     """
     List the contents of a directory.
 
     Args:
-        relative_workspace_path: Path to list contents of
+        path: Absolute path of the directory to list. A relative value is
+            resolved against the current working directory as a fallback.
         agent: Reference to the agent instance for permission checks
 
     Returns:
@@ -331,30 +332,31 @@ def list_directory(
     """
     # No permission required for listing directories
     try:
-        logger.debug(f"Listing directory: {relative_workspace_path}")
+        path = os.path.abspath(path)
+        logger.debug(f"Listing directory: {path}")
 
-        if not os.path.exists(relative_workspace_path):
-            logger.warning(f"Directory does not exist: {relative_workspace_path}")
-            return {"error": f"Directory {relative_workspace_path} does not exist"}
+        if not os.path.exists(path):
+            logger.warning(f"Directory does not exist: {path}")
+            return {"error": f"Directory {path} does not exist"}
 
-        if not os.path.isdir(relative_workspace_path):
-            logger.warning(f"Not a directory: {relative_workspace_path}")
-            return {"error": f"{relative_workspace_path} is not a directory"}
+        if not os.path.isdir(path):
+            logger.warning(f"Not a directory: {path}")
+            return {"error": f"{path} is not a directory"}
 
         # Get the directory contents
         contents = []
-        for item in os.listdir(relative_workspace_path):
-            item_path = os.path.join(relative_workspace_path, item)
+        for item in os.listdir(path):
+            item_path = os.path.join(path, item)
             item_type = "dir" if os.path.isdir(item_path) else "file"
             item_size = os.path.getsize(item_path) if item_type == "file" else None
 
             contents.append({"name": item, "type": item_type, "size": item_size, "path": item_path})
 
-        logger.debug(f"Listed {len(contents)} items in directory: {relative_workspace_path}")
+        logger.debug(f"Listed {len(contents)} items in directory: {path}")
         return {"contents": contents}
 
     except Exception as e:
-        logger.error(f"Error listing directory {relative_workspace_path}: {str(e)}")
+        logger.error(f"Error listing directory {path}: {str(e)}")
         return {"error": str(e)}
 
 

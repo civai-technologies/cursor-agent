@@ -343,6 +343,9 @@ def web_search(
         if not requires_up_to_date and not force:
             logger.info("Search does not require up-to-date information, skipping web search")
             return {
+                "ok": True,
+                "skipped": True,
+                "reason": "not_time_sensitive",
                 "results": [],
                 "message": "This query doesn't require up-to-date information. Set force=True to force a web search."
             }
@@ -355,6 +358,8 @@ def web_search(
         if not search_results:
             logger.warning("No search results found")
             return {
+                "ok": True,
+                "skipped": False,
                 "results": [],
                 "message": "No search results found"
             }
@@ -364,9 +369,10 @@ def web_search(
 
         # Format results
         results = []
-        for url, summary in content_summaries.items():
+        for idx, (url, summary) in enumerate(content_summaries.items(), start=1):
             if url in search_results:
-                title = search_results[url].get('title', 'Unknown Title')
+                raw_title = search_results[url].get('title') or ''
+                title = raw_title.strip() or url or f"Result {idx}"
                 results.append({
                     "title": title,
                     "url": url,
@@ -375,6 +381,8 @@ def web_search(
 
         logger.info(f"Web search completed. Found {len(results)} relevant results")
         return {
+            "ok": True,
+            "skipped": False,
             "query": search_term,
             "results": results,
             "total_results": len(results)
@@ -382,7 +390,7 @@ def web_search(
 
     except Exception as error:
         logger.error(f"Error in web search: {str(error)}")
-        return {"error": str(error), "results": []}
+        return {"ok": False, "error": str(error), "results": []}
 
 
 def google_search_sync(query: str, api_key: str, search_engine_id: str, max_results: int = 5) -> Dict[str, Dict[str, Any]]:
@@ -438,7 +446,8 @@ def google_search_sync(query: str, api_key: str, search_engine_id: str, max_resu
                 # Process results from this call
                 for item in items:
                     link = item.get('link', '')
-                    title = item.get('title', '')
+                    raw_title = item.get('title') or ''
+                    title = raw_title.strip() or link or f"Result {results_collected + 1}"
                     snippet = item.get('snippet', '')
 
                     if link:

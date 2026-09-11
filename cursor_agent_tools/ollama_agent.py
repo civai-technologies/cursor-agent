@@ -4,6 +4,13 @@ import os
 from typing import Any, Dict, List, Optional, Callable, Union, TypedDict, cast
 
 from .base import BaseAgent, AgentResponse
+from .schemas import (
+    TERMINATE_TEXT_SENTINEL,
+    build_agent_tool_call,
+    enrich_agent_response,
+    is_terminate_tool,
+    llm_tool_content,
+)
 from .logger import get_logger
 from .permissions import PermissionOptions, PermissionRequest, PermissionStatus
 
@@ -29,6 +36,44 @@ class ToolCallResult(TypedDict):
     parameters: Dict[str, Any]
     output: str
     error: Optional[str]
+
+
+def _openai_strict_property(prop: Any) -> Dict[str, Any]:
+    """Normalize one JSON-schema property to OpenAI-strict (single string type)."""
+    if not isinstance(prop, dict):
+        return {"type": "string"}
+    out = dict(prop)
+    t = out.get("type")
+    if isinstance(t, list):
+        # Prefer first non-null concrete type; default string
+        concrete = [x for x in t if x not in (None, "null")]
+        out["type"] = concrete[0] if concrete else "string"
+    elif t is None:
+        out["type"] = "string"
+    # Recurse into nested object properties / array items
+    if isinstance(out.get("properties"), dict):
+        out["properties"] = {
+            k: _openai_strict_property(v) for k, v in out["properties"].items()
+        }
+    if isinstance(out.get("items"), dict):
+        out["items"] = _openai_strict_property(out["items"])
+    if isinstance(out.get("additionalProperties"), dict):
+        out["additionalProperties"] = _openai_strict_property(
+            out["additionalProperties"]
+        )
+    return out
+
+
+def _openai_strict_parameters(parameters: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a tool parameters object for OpenAI / Ollama clients."""
+    params = dict(parameters or {})
+    props = params.get("properties") or {}
+    if isinstance(props, dict):
+        params["properties"] = {
+            k: _openai_strict_property(v) for k, v in props.items()
+        }
+    params.setdefault("type", "object")
+    return params
 
 
 class OllamaAgent(BaseAgent):
@@ -303,18 +348,18 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
                     elif "What is the capital of France?" in message:
                         content = "The capital of France is Paris. It's one of the most visited cities in the world and known for landmarks like the Eiffel Tower and the Louvre Museum."
 
-                # Check for tool_calls in the response
+                # Single completion + at most one tool-exec round.
+                # Multi-step continuation belongs to run_agent_interactive (harness).
+                all_tool_calls: List[Dict[str, Any]] = []
                 tool_calls = []
                 if hasattr(response.message, "tool_calls") and response.message.tool_calls:
-                    logger.debug(f"Received tool calls from model: {response.message.tool_calls}")
-                    # Process and execute tool calls from Ollama format
+                    logger.debug(
+                        f"Received tool calls from model: {response.message.tool_calls}"
+                    )
                     for tool_call in response.message.tool_calls:
                         if hasattr(tool_call, "function"):
-                            # Extract tool call details
                             tool_name = tool_call.function.name
-                            tool_args = {}
-
-                            # Convert arguments from either string or dict
+                            tool_args: Dict[str, Any] = {}
                             if hasattr(tool_call.function, "arguments"):
                                 if isinstance(tool_call.function.arguments, str):
                                     import json
@@ -328,30 +373,26 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
                                         tool_args = {}
                                 elif isinstance(tool_call.function.arguments, dict):
                                     tool_args = tool_call.function.arguments
-
                             tool_calls.append({"name": tool_name, "parameters": tool_args})
 
-                # Execute tool calls if present
                 if tool_calls:
-                    # Process and execute tool calls
+                    logger.info(
+                        "Executing %s Ollama tool call(s) (single round; harness continues)",
+                        len(tool_calls),
+                    )
                     tool_calls_results = self._execute_tool_calls(tool_calls)
+                    all_tool_calls.extend(tool_calls_results)
+                    if any(
+                        is_terminate_tool(r.get("name")) for r in tool_calls_results
+                    ):
+                        content = content or TERMINATE_TEXT_SENTINEL
 
-                    # Format tool calls for agent response
-                    agent_tool_calls = [
-                        {
-                            "name": result["name"],
-                            "parameters": result["parameters"],
-                            "output": result["output"],
-                            "error": result["error"],
-                            "thinking": None,
-                        }
-                        for result in tool_calls_results
-                    ]
-
-                    # Return structured agent response
+                if all_tool_calls:
                     return cast(
                         AgentResponse,
-                        {"message": content, "tool_calls": agent_tool_calls, "thinking": None},
+                        enrich_agent_response(
+                            {"message": content, "tool_calls": all_tool_calls, "thinking": None}
+                        ),
                     )
                 else:
                     # Return just the message content for simple responses
@@ -533,6 +574,9 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
         """
         Format the registered tools for Ollama API.
 
+        Property schemas are normalized to OpenAI-strict single-string `type`
+        values so the Ollama Python SDK's Tool model can validate them.
+
         Returns:
             Tools in the format expected by Ollama
         """
@@ -544,17 +588,14 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
         tools: List[Dict[str, Any]] = []
 
         for name, tool_data in self.available_tools.items():
+            parameters = tool_data["schema"]["parameters"]
             tools.append(
                 {
                     "type": "function",
                     "function": {
                         "name": name,
                         "description": tool_data["schema"]["description"],
-                        "parameters": {
-                            "type": "object",
-                            "properties": tool_data["schema"]["parameters"]["properties"],
-                            "required": tool_data["schema"]["parameters"].get("required", []),
-                        },
+                        "parameters": _openai_strict_parameters(parameters),
                     },
                 }
             )
@@ -582,49 +623,44 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
 
                 logger.debug(f"Executing tool: {tool_name} with parameters: {parameters}")
 
-                if tool_name in self.available_tools:
-                    # Execute the tool with parameters
-                    tool_function = self.available_tools[tool_name]["function"]
-                    result = tool_function(**parameters)
+                if not isinstance(parameters, dict):
+                    parameters = {}
 
-                    tool_results.append(
-                        {
-                            "name": tool_name,
-                            "parameters": parameters,
-                            "output": result.get("output", ""),
-                            "error": result.get("error", None),
-                        }
+                normalized = self.run_registered_tool(tool_name, parameters)
+                content = llm_tool_content(normalized)
+                tool_results.append(
+                    build_agent_tool_call(
+                        tool_name,
+                        parameters,
+                        normalized,
+                        thinking=None,
+                        llm_content=content,
                     )
+                )
 
-                    # Add the tool response to conversation history
-                    self.conversation_history.append(
-                        {
-                            "role": "tool",
-                            "content": str(result.get("output", "")),
-                            "name": tool_name,
-                        }
-                    )
-                else:
-                    error_msg = f"Tool '{tool_name}' not found"
-                    logger.warning(error_msg)
-                    tool_results.append(
-                        {
-                            "name": tool_name,
-                            "parameters": parameters,
-                            "output": "",
-                            "error": error_msg,
-                        }
-                    )
+                self.conversation_history.append(
+                    {
+                        "role": "tool",
+                        "content": content,
+                        "name": tool_name,
+                    }
+                )
             except Exception as e:
                 error_msg = f"Error executing tool: {str(e)}"
                 logger.error(error_msg)
+                normalized = {
+                    "ok": False,
+                    "output": "",
+                    "error": error_msg,
+                    "data": None,
+                }
                 tool_results.append(
-                    {
-                        "name": call.get("name", "unknown"),
-                        "parameters": call.get("parameters", {}),
-                        "output": "",
-                        "error": error_msg,
-                    }
+                    build_agent_tool_call(
+                        call.get("name", "unknown"),
+                        call.get("parameters", {}),
+                        normalized,
+                        thinking=None,
+                    )
                 )
 
         return tool_results
