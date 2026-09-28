@@ -4,7 +4,7 @@ import json
 import time
 from typing import Any, Dict, List, Optional, Callable, cast, Union
 
-from openai import AsyncOpenAI, BadRequestError, RateLimitError, APIError, AuthenticationError
+from openai import AsyncOpenAI, BadRequestError, RateLimitError, APIError, AuthenticationError, NOT_GIVEN
 
 from .base import BaseAgent, AgentResponse, AgentToolCall
 from .schemas import (
@@ -390,8 +390,8 @@ This is the ONLY acceptable format for code citations. The format is ```startLin
                 kind="chat",
                 model=self.model if self.model else "gpt-4-turbo",
                 messages=messages,
-                tools=tools,
-                tool_choice="auto" if tools else None,
+                tools=tools if tools else NOT_GIVEN,
+                tool_choice="auto" if tools else NOT_GIVEN,
                 max_tokens=max_tokens_value,
                 temperature=self.temperature,
             )
