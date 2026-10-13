@@ -1,0 +1,46 @@
+spec_version: "0.1.0"
+name: cursor-agent
+version: 1.0.0
+description: >
+  A Python-based AI coding agent that replicates Cursor's coding assistant capabilities.
+  Supports function calling, code generation, precise file editing, code analysis, web search,
+  and intelligent coding assistance. Works with Anthropic Claude, OpenAI GPT-4, and locally
+  hosted Ollama models. Includes a robust permission system for secure file operations and
+  command execution.
+license: MIT
+model:
+  preferred: anthropic:claude-sonnet-4-5-20250929
+  alternatives:
+    - openai:gpt-4o
+    - ollama:llama3
+runtime:
+  max_turns: 50
+skills:
+  - name: read_file
+    description: Read file contents with flexible line range control
+  - name: edit_file
+    description: Make precise edits to files with line-based or full-replacement instructions
+  - name: create_file
+    description: Create new files with specified content
+  - name: delete_file
+    description: Remove files from the filesystem (with optional deletion protection)
+  - name: list_dir
+    description: List directory contents to understand project structure
+  - name: codebase_search
+    description: Semantic search across codebases to find relevant code snippets
+  - name: grep_search
+    description: Perform regex-based text search in files
+  - name: file_search
+    description: Fuzzy search for files by name
+  - name: web_search
+    description: Search the web for up-to-date information
+  - name: trend_search
+    description: Search for trending topics and their latest developments
+  - name: query_images
+    description: Analyze and describe images using LLM vision capabilities
+  - name: run_terminal_cmd
+    description: Execute terminal commands with configurable user approval
+compliance:
+  risk_tier: standard
+  supervision:
+    human_in_the_loop: destructive
