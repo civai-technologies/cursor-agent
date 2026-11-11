@@ -228,7 +228,7 @@ class TestOllamaAgent(unittest.TestCase):
             if response.get("tool_calls"):
                 print(f"Tool calls: {len(response['tool_calls'])} tool(s) called")
                 for i, tool_call in enumerate(response["tool_calls"]):
-                    print(f"  Tool {i+1}: {tool_call.get('name')} with params: {tool_call.get('parameters')}")
+                    print(f"  Tool {i + 1}: {tool_call.get('name')} with params: {tool_call.get('parameters')}")
         else:
             resp_str = str(response)
             print("Response type: String")
@@ -294,7 +294,7 @@ class TestOllamaAgent(unittest.TestCase):
             if chat_response.get("tool_calls"):
                 print(f"Tool calls: {len(chat_response['tool_calls'])} tool(s) called")
                 for i, tool_call in enumerate(chat_response["tool_calls"]):
-                    print(f"  Tool {i+1}: {tool_call.get('name')} with params: {tool_call.get('parameters')}")
+                    print(f"  Tool {i + 1}: {tool_call.get('name')} with params: {tool_call.get('parameters')}")
         else:
             resp_str = str(chat_response)
             print("Response type: String")

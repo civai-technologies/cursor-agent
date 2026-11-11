@@ -468,11 +468,11 @@ def apply_line_based_edit(original_content: str, line_edits: Dict[str, str]) -> 
 
                 # Validate indices
                 if start_idx < 0:
-                    logger.warning(f"Invalid start index {start_idx+1}, adjusting to 1")
+                    logger.warning(f"Invalid start index {start_idx + 1}, adjusting to 1")
                     start_idx = 0
 
                 if end_idx >= len(original_lines):
-                    logger.warning(f"Invalid end index {end_idx+1}, adjusting to {len(original_lines)}")
+                    logger.warning(f"Invalid end index {end_idx + 1}, adjusting to {len(original_lines)}")
                     end_idx = len(original_lines) - 1
 
                 if start_idx > end_idx:
@@ -483,8 +483,8 @@ def apply_line_based_edit(original_content: str, line_edits: Dict[str, str]) -> 
                 new_content = line_edits[line_range]
                 new_lines = new_content.splitlines()
 
-                logger.debug(f"Replacing lines {start_idx+1}-{end_idx+1} with {len(new_lines)} new lines")
-                logger.debug(f"Original lines: {original_lines[start_idx:end_idx+1]}")
+                logger.debug(f"Replacing lines {start_idx + 1}-{end_idx + 1} with {len(new_lines)} new lines")
+                logger.debug(f"Original lines: {original_lines[start_idx:end_idx + 1]}")
                 logger.debug(f"New lines: {new_lines}")
 
                 # Replace the specified lines with the new content

@@ -524,7 +524,7 @@ First, I'll create a plan for how to approach this task, then implement it step 
     logger.info(f"Interactive session complete: {iteration - 1} iterations, {total_tool_calls} tool calls")
 
     # Return a structured response with detailed information
-    session_summary = f"Interactive session completed after {iteration-1} iterations with {total_tool_calls} tool calls."
+    session_summary = f"Interactive session completed after {iteration - 1} iterations with {total_tool_calls} tool calls."
 
     # Check if we have a final response
     final_message = response if 'response' in locals() else session_summary
