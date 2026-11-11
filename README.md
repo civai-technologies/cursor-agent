@@ -157,6 +157,38 @@ ollama_agent = create_agent(model='ollama-llama3')
 response = await ollama_agent.chat("What's a good way to implement a cache in Python?")
 ```
 
+### Tsubasa text chat
+
+The existing `OpenAIAgent` accepts a custom Chat Completions endpoint:
+
+```python
+import asyncio
+import os
+from cursor_agent_tools import OpenAIAgent
+
+async def main():
+    agent = OpenAIAgent(
+        api_key=os.environ["TSUBASA_API_KEY"],
+        base_url="https://api.tsubasa.sh/v1",
+        model="tsubasa-fast",  # or tsubasa-pro
+        max_tokens=4096,
+    )
+    agent.system_prompt = "You are a helpful coding assistant."
+    try:
+        response = await agent.chat("Explain a Python context manager briefly.")
+        print(response["message"])
+    finally:
+        await agent.client.close()
+
+asyncio.run(main())
+```
+
+This sends prompts and your Tsubasa key to `api.tsubasa.sh`. The example does not
+register tools or send images. Both aliases have a 32,768-token context window;
+keep instructions and conversation history within the space left by
+`max_tokens`. Fast allows up to 8,192 output tokens and Pro up to 16,384. See the
+[Tsubasa API documentation](https://tsubasa.sh/docs/api).
+
 ### Using Local Ollama Models
 
 ```python
