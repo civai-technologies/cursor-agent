@@ -91,3 +91,42 @@ tests/test_files_tmp
 demo_files/*
 *.code-workspace
 *.py-e
+
+# --- gitignore hardening (2026-11-11): never commit secrets or generated files ---
+# Secrets and credentials
+.env.*
+*.env.bak*
+*.pem
+*.key
+*.p12
+*.p8
+*.jks
+*.keystore
+key.properties
+*service-account*.json
+*-credentials.json
+credentials/
+*.tfvars
+*secret*.local.*
+google_request_tokens.json
+.netrc
+!.env.example
+!.env.sample
+!.env.template
+!*.tfvars.example
+# Dependencies, build output, caches and OS junk
+node_modules/
+.next/
+**/ios/Pods/
+**/vendor/bundle/
+coverage/
+.expo/
+response_cache/
+.chrome-profile*/
+chrome-profile*/
+chrome_profile*/
+browser-profile*/
+browser_profile*/
+user-data-dir/
+**/playwright/.auth/
+# --- end gitignore hardening ---
